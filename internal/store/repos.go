@@ -117,8 +117,7 @@ func (s *Store) GetSeenRepos() (map[string]time.Time, error) {
 		if err := rows.Scan(&name, &ts); err != nil {
 			return nil, err
 		}
-		t, _ := time.Parse(time.RFC3339, ts)
-		seen[name] = t
+		seen[name] = parseDBTime(ts)
 	}
 	return seen, rows.Err()
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/takoyaro/gitvoyager/internal/config"
 	_ "modernc.org/sqlite"
 )
 
@@ -15,7 +16,10 @@ type Store struct {
 	db *sql.DB
 }
 
-func New(dbPath string) (*Store, error) {
+// New opens (or creates) the database and runs migrations.
+// excCfg is optional — if non-nil, its values are seeded into the exclusions table
+// on first run (idempotent via INSERT OR IGNORE).
+func New(dbPath string, excCfg *config.ExclusionsConfig) (*Store, error) {
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -30,6 +34,19 @@ func New(dbPath string) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+
+	// Seed exclusions from config (idempotent).
+	if excCfg != nil {
+		for _, kw := range excCfg.Keywords {
+			_ = s.AddExclusion("keyword", kw)
+		}
+		for _, t := range excCfg.Topics {
+			_ = s.AddExclusion("topic", t)
+		}
+		for _, o := range excCfg.Owners {
+			_ = s.AddExclusion("owner", o)
+		}
 	}
 
 	return s, nil
@@ -58,7 +75,10 @@ func (s *Store) migrate() error {
 	if err := s.migration006(); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(migration007)
+	if _, err := s.db.Exec(migration007); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(migration008)
 	return err
 }
 

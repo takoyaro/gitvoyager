@@ -3,13 +3,13 @@ package store
 import "time"
 
 type SavedSearch struct {
-	ID          int64
-	Query       string
-	SortField   string
-	Language    string
-	ResultCount int
-	SearchedAt  time.Time
-	Bookmarked  bool
+	ID          int64     `json:"id"`
+	Query       string    `json:"query"`
+	SortField   string    `json:"sort_field"`
+	Language    string    `json:"language,omitempty"`
+	ResultCount int       `json:"result_count"`
+	SearchedAt  time.Time `json:"searched_at"`
+	Bookmarked  bool      `json:"bookmarked,omitempty"`
 }
 
 func (s *Store) SaveSearch(query, sortField, language string, resultCount int) error {

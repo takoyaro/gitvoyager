@@ -9,43 +9,43 @@ import (
 
 type Repo struct {
 	// Identity
-	ID       int64
-	FullName string // "owner/name"
-	Owner    string
-	Name     string
-	URL      string
+	ID       int64  `json:"id"`
+	FullName string `json:"full_name"`
+	Owner    string `json:"owner"`
+	Name     string `json:"name"`
+	URL      string `json:"url,omitempty"`
 
 	// From gh search (always available)
-	Description string
-	Language    string
-	Stars       int
-	Forks       int
-	OpenIssues  int
-	License     string
-	IsArchived  bool
-	IsFork      bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	PushedAt    time.Time
+	Description string    `json:"description"`
+	Language    string    `json:"language"`
+	Stars       int       `json:"stars"`
+	Forks       int       `json:"forks"`
+	OpenIssues  int       `json:"open_issues,omitempty"`
+	License     string    `json:"license,omitempty"`
+	IsArchived  bool      `json:"is_archived,omitempty"`
+	IsFork      bool      `json:"is_fork,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	PushedAt    time.Time `json:"pushed_at,omitempty"`
 
 	// From GraphQL enrichment (lazy)
-	Topics        []string
-	WatcherCount  int
-	CommitCount   int // recent commits (~last month)
-	ReadmeContent string
-	Enriched      bool
+	Topics        []string `json:"topics,omitempty"`
+	WatcherCount  int      `json:"watcher_count,omitempty"`
+	CommitCount   int      `json:"commit_count,omitempty"`
+	ReadmeContent string   `json:"-"`
+	Enriched      bool     `json:"-"`
 
 	// Computed scores (populated after fetch)
-	UnderdogScore   float64 // forks+issues relative to stars
-	DiscoveryScore  float64 // multi-signal, age-normalised
-	FreshnessScore  float64 // quality-weighted signal for brand-new repos
-	StarPercentile  int     // 0–10, percentile rank within result set
+	UnderdogScore   float64 `json:"underdog_score,omitempty"`
+	DiscoveryScore  float64 `json:"discovery_score,omitempty"`
+	FreshnessScore  float64 `json:"freshness_score,omitempty"`
+	StarPercentile  int     `json:"star_percentile,omitempty"`
 
 	// Local tracking
-	DiscoveredAt time.Time
-	SeenAt       *time.Time
-	Watchlisted  bool
-	StarDelta    int // stars gained since first seen; negative = lost stars
+	DiscoveredAt time.Time  `json:"discovered_at"`
+	SeenAt       *time.Time `json:"seen_at,omitempty"`
+	Watchlisted  bool       `json:"watchlisted,omitempty"`
+	StarDelta    int        `json:"star_delta,omitempty"`
 }
 
 type SortField string
@@ -80,6 +80,11 @@ type SearchParams struct {
 	Created         string // date filter, e.g. ">2026-01-01"
 	MaxPushedAge    time.Duration  // post-fetch filter: drop repos not pushed within this duration
 	PostFilter      PostFilter     // two-phase scoring/filtering applied after fetch
+
+	// Global exclusions (injected from config)
+	ExcludeTopics   []string // appended as -topic:x qualifiers
+	ExcludeOwners   []string // appended as -user:x qualifiers
+	ExcludeKeywords []string // post-fetch: drop repos matching name/description
 }
 
 func DefaultSearchParams() SearchParams {
