@@ -67,6 +67,38 @@ func (s *Store) MarkSeen(repoFullName string) error {
 	return err
 }
 
+// ToggleWatch adds or removes a repo from the watchlist.
+// Returns true if the repo is now watched, false if unwatched.
+func (s *Store) ToggleWatch(fullName string) (bool, error) {
+	var count int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM watchlist WHERE full_name = ?`, fullName).Scan(&count)
+	if count > 0 {
+		_, err := s.db.Exec(`DELETE FROM watchlist WHERE full_name = ?`, fullName)
+		return false, err
+	}
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO watchlist (full_name) VALUES (?)`, fullName)
+	return err == nil, err
+}
+
+// GetWatchlist returns the set of watched repo full names.
+func (s *Store) GetWatchlist() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT full_name FROM watchlist`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	watched := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		watched[name] = true
+	}
+	return watched, rows.Err()
+}
+
 func (s *Store) GetSeenRepos() (map[string]time.Time, error) {
 	rows, err := s.db.Query(`
 		SELECT r.full_name, MAX(s.seen_at)

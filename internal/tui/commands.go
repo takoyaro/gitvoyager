@@ -84,6 +84,32 @@ func debounceDetailCmd(tag int, delay time.Duration) tea.Cmd {
 	})
 }
 
+func loadWatchlistCmd(st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return watchlistLoadedMsg{}
+		}
+		watched, _ := st.GetWatchlist()
+		if watched == nil {
+			watched = make(map[string]bool)
+		}
+		return watchlistLoadedMsg{WatchSet: watched}
+	}
+}
+
+func toggleWatchCmd(st *store.Store, fullName string) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return watchToggledMsg{FullName: fullName, Watched: false}
+		}
+		watched, err := st.ToggleWatch(fullName)
+		if err != nil {
+			return statusMsg{Text: "Watch failed: " + err.Error(), IsError: true}
+		}
+		return watchToggledMsg{FullName: fullName, Watched: watched}
+	}
+}
+
 func loadSearchHistoryCmd(st *store.Store) tea.Cmd {
 	return func() tea.Msg {
 		if st == nil {

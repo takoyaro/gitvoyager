@@ -11,6 +11,8 @@ type keyMap struct {
 	Sort    key.Binding
 	Open    key.Binding
 	Clone   key.Binding
+	Watch   key.Binding
+	Filter  key.Binding
 	Help    key.Binding
 	Quit    key.Binding
 	Tab     key.Binding
@@ -54,6 +56,14 @@ var keys = keyMap{
 		key.WithKeys("c"),
 		key.WithHelp("c", "clone"),
 	),
+	Watch: key.NewBinding(
+		key.WithKeys("w"),
+		key.WithHelp("w", "watch"),
+	),
+	Filter: key.NewBinding(
+		key.WithKeys("f"),
+		key.WithHelp("f", "filter"),
+	),
 	Help: key.NewBinding(
 		key.WithKeys("?"),
 		key.WithHelp("?", "help"),
@@ -89,14 +99,14 @@ var keys = keyMap{
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Search, k.Open, k.Clone, k.Sort, k.Help, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Search, k.Filter, k.Open, k.Clone, k.Watch, k.Sort, k.Help, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Enter, k.Back},
-		{k.Search, k.Sort, k.Tab},
-		{k.Open, k.Clone},
+		{k.Search, k.Sort, k.Filter, k.Tab},
+		{k.Open, k.Clone, k.Watch},
 		{k.PageUp, k.PageDn, k.GoTop, k.GoEnd},
 		{k.Help, k.Quit},
 	}

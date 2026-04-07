@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/takoyaro/gitvoyager/internal/config"
@@ -30,26 +31,31 @@ const (
 
 type appModel struct {
 	// Components
-	list      listModel
-	detail    detailModel
-	searchBar searchBarModel
-	statusBar statusBarModel
-	helpView  helpModel
+	list        listModel
+	detail      detailModel
+	searchBar   searchBarModel
+	statusBar   statusBarModel
+	helpView    helpModel
+	filterInput textinput.Model
 
 	// State
-	repos     []model.Repo
-	focus     pane
-	state     appState
-	loading   bool
-	detailTag int
-	width     int
-	height    int
-	authOk    bool
+	repos      []model.Repo
+	focus      pane
+	state      appState
+	loading    bool
+	detailTag  int
+	width      int
+	height     int
+	authOk     bool
+	filterMode bool
 
 	// Search state
 	searchParams  model.SearchParams
 	searchHistory []searchHistoryItem
 	historyCursor int // cursor into searchHistory on prompt screen
+
+	// Local sets
+	watchSet map[string]bool
 
 	// Dependencies
 	cfg    *config.Config
@@ -58,13 +64,19 @@ type appModel struct {
 }
 
 func NewApp(cfg *config.Config, st *store.Store, gh *github.Client, initialQuery string) *appModel {
+	fi := textinput.New()
+	fi.Placeholder = "filter…"
+	fi.Prompt = "  filter: "
+
 	m := &appModel{
 		list:         newListModel(),
 		detail:       newDetailModel(),
 		searchBar:    newSearchBar(),
 		statusBar:    newStatusBar(),
 		helpView:     newHelpModel(),
+		filterInput:  fi,
 		searchParams: model.DefaultSearchParams(),
+		watchSet:     make(map[string]bool),
 		cfg:          cfg,
 		store:        st,
 		github:       gh,
@@ -94,6 +106,7 @@ func (m *appModel) Init() tea.Cmd {
 		fetchRateLimitCmd(m.github),
 		m.searchBar.input.Focus(),
 		loadSearchHistoryCmd(m.store),
+		loadWatchlistCmd(m.store),
 	}
 
 	if m.searchParams.Query != "" {
@@ -137,8 +150,14 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case searchResultsMsg:
 		m.repos = msg.Repos
+		model.ComputeScores(m.repos)
+		// Apply watchlist state
+		for i := range m.repos {
+			m.repos[i].Watchlisted = m.watchSet[m.repos[i].FullName]
+		}
 		m.loading = false
 		m.list.SetRepos(m.repos)
+		m.list.SetWatched(m.watchSet)
 		m.searchBar.SetQuery(msg.Query)
 		m.searchBar.SetCount(len(m.repos))
 		m.statusBar.SetCounts(len(m.repos), m.list.Len())
@@ -234,6 +253,34 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.historyCursor = -1 // no selection
 		return m, nil
 
+	case watchlistLoadedMsg:
+		m.watchSet = msg.WatchSet
+		if m.watchSet == nil {
+			m.watchSet = make(map[string]bool)
+		}
+		m.list.SetWatched(m.watchSet)
+		return m, nil
+
+	case watchToggledMsg:
+		m.watchSet[msg.FullName] = msg.Watched
+		if !msg.Watched {
+			delete(m.watchSet, msg.FullName)
+		}
+		// Update the repo slice
+		for i := range m.repos {
+			if m.repos[i].FullName == msg.FullName {
+				m.repos[i].Watchlisted = msg.Watched
+				break
+			}
+		}
+		m.list.SetWatched(m.watchSet)
+		action := "Watching"
+		if !msg.Watched {
+			action = "Unwatched"
+		}
+		m.statusBar.SetMessage(action+" "+msg.FullName, false)
+		return m, clearStatusAfter(3 * time.Second)
+
 	case cloneFinishedMsg:
 		if msg.Err != nil {
 			m.statusBar.SetMessage("Clone failed: "+msg.Err.Error(), true)
@@ -287,7 +334,37 @@ func (m *appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *appModel) launchPreset(idx int) (tea.Model, tea.Cmd) {
+	presets := model.GetPresets()
+	if idx < 0 || idx >= len(presets) {
+		return m, nil
+	}
+	m.searchParams = presets[idx].Params
+	m.loading = true
+	m.searchBar.Blur()
+	m.focus = paneList
+	m.historyCursor = -1
+	return m, tea.Batch(
+		searchReposCmd(m.github, m.store, m.searchParams),
+		fetchRateLimitCmd(m.github),
+	)
+}
+
 func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Preset shortcuts when the input is empty
+	if m.searchBar.Value() == "" {
+		switch msg.String() {
+		case "1":
+			return m.launchPreset(0)
+		case "2":
+			return m.launchPreset(1)
+		case "3":
+			return m.launchPreset(2)
+		case "4":
+			return m.launchPreset(3)
+		}
+	}
+
 	switch {
 	case key.Matches(msg, keys.Escape):
 		if m.state == stateBrowsing {
@@ -357,7 +434,33 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m *appModel) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, keys.Escape):
+		m.filterMode = false
+		m.filterInput.SetValue("")
+		m.filterInput.Blur()
+		m.list.SetFilter("")
+		m.statusBar.SetCounts(len(m.repos), m.list.Len())
+		return m, nil
+	case msg.String() == "enter":
+		m.filterMode = false
+		m.filterInput.Blur()
+		return m, nil
+	default:
+		var cmd tea.Cmd
+		m.filterInput, cmd = m.filterInput.Update(msg)
+		m.list.SetFilter(m.filterInput.Value())
+		m.statusBar.SetCounts(len(m.repos), m.list.Len())
+		return m, cmd
+	}
+}
+
 func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.filterMode {
+		return m.handleFilterKey(msg)
+	}
+
 	prevCursor := m.list.cursor
 
 	switch {
@@ -395,6 +498,14 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.statusBar.SetMessage("Cloning "+sel.FullName+"...", false)
 			return m, cloneRepoCmd(m.github, sel.FullName, m.cfg.Clone.DefaultDirectory)
 		}
+	case key.Matches(msg, keys.Watch):
+		if sel := m.list.Selected(); sel != nil {
+			return m, toggleWatchCmd(m.store, sel.FullName)
+		}
+	case key.Matches(msg, keys.Filter):
+		m.filterMode = true
+		m.filterInput.Focus()
+		return m, m.filterInput.Focus()
 
 	case key.Matches(msg, keys.Tab):
 		m.focus = paneDetail
@@ -442,6 +553,10 @@ func (m *appModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.statusBar.SetMessage("Cloning "+sel.FullName+"...", false)
 			return m, cloneRepoCmd(m.github, sel.FullName, m.cfg.Clone.DefaultDirectory)
 		}
+	case key.Matches(msg, keys.Watch):
+		if sel := m.list.Selected(); sel != nil {
+			return m, toggleWatchCmd(m.store, sel.FullName)
+		}
 
 	case key.Matches(msg, keys.Tab):
 		m.focus = paneList
@@ -465,6 +580,16 @@ func (m *appModel) cycleSort() tea.Cmd {
 			m.searchBar.SetSort(string(next))
 			break
 		}
+	}
+
+	// Score sort is applied client-side — no API re-fetch needed
+	if m.searchParams.Sort == model.SortScore {
+		if len(m.repos) > 0 {
+			model.SortByScore(m.repos)
+			m.list.SetRepos(m.repos)
+			m.list.SetWatched(m.watchSet)
+		}
+		return nil
 	}
 
 	if m.searchParams.Query != "" {
@@ -495,9 +620,16 @@ func (m *appModel) recalcLayout() {
 		contentH = 1
 	}
 
-	m.list.SetSize(listW, contentH)
+	// Reserve 1 row for the filter bar (always present in list pane)
+	listContentH := contentH - 1
+	if listContentH < 1 {
+		listContentH = 1
+	}
+
+	m.list.SetSize(listW, listContentH)
 	m.detail.SetSize(detailW, contentH)
 	m.searchBar.SetWidth(m.width)
+	m.filterInput.SetWidth(listW - 12)
 	m.statusBar.SetWidth(m.width)
 	m.helpView.SetSize(m.width, m.height)
 }
@@ -528,7 +660,8 @@ func (m *appModel) View() tea.View {
 	// Main browsing layout
 	header := m.searchBar.View()
 
-	listView := m.list.View()
+	filterBar := m.renderFilterBar()
+	listView := lipgloss.JoinVertical(lipgloss.Left, filterBar, m.list.View())
 	border := lipgloss.NewStyle().
 		Foreground(colorBorder).
 		Render(lipgloss.NewStyle().Height(m.height - 3).Render("│"))
@@ -543,6 +676,16 @@ func (m *appModel) View() tea.View {
 
 	v.Content = lipgloss.JoinVertical(lipgloss.Left, header, content, status)
 	return v
+}
+
+func (m *appModel) renderFilterBar() string {
+	if m.filterMode {
+		return styleAccent.Render("  ") + m.filterInput.View()
+	}
+	if f := m.filterInput.Value(); f != "" {
+		return styleSubtle.Render(fmt.Sprintf("  filter: %s  (esc to clear)", f))
+	}
+	return styleSubtle.Render("  f: filter")
 }
 
 func (m *appModel) renderSearchPrompt() string {
@@ -568,6 +711,16 @@ func (m *appModel) renderSearchPrompt() string {
 		searchInput,
 		"",
 		examples,
+		"",
+		styleSubtle.Render("  Quick Discovery"),
+	}
+
+	for _, p := range model.GetPresets() {
+		key := styleAccent.Render("  [" + p.Key + "] ")
+		name := lipgloss.NewStyle().Bold(true).Render(p.Name)
+		desc := styleSubtle.Render("  " + p.Description)
+		parts = append(parts, key+name)
+		parts = append(parts, desc)
 	}
 
 	// Show search history

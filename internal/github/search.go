@@ -33,8 +33,11 @@ func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]
 	if params.Stars != "" {
 		args = append(args, "--stars="+params.Stars)
 	}
-	if params.Sort != "" {
+	if params.Sort != "" && params.Sort != model.SortScore {
 		args = append(args, "--sort="+string(params.Sort))
+	}
+	if params.GoodFirstIssues != "" {
+		args = append(args, "--good-first-issues="+params.GoodFirstIssues)
 	}
 	if params.Order != "" {
 		args = append(args, "--order="+params.Order)

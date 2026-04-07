@@ -37,7 +37,7 @@ func (m *detailModel) SetSize(w, h int) {
 }
 
 func (m *detailModel) headerHeight() int {
-	return 5 // title + stats + topics + description + separator
+	return 6 // title + stats + enriched stats + topics + description + separator
 }
 
 func (m *detailModel) SetRepo(r *model.Repo) {
@@ -133,6 +133,27 @@ func (m *detailModel) renderHeader() string {
 		fmt.Sprintf("%s  %s  %s%s%s", stars, forks, issues, lang, lic),
 	)
 
+	// Enriched stats (watchers, commits, score)
+	enrichedStats := ""
+	if r.Enriched {
+		parts := []string{}
+		if r.WatcherCount > 0 {
+			parts = append(parts, fmt.Sprintf("👁 %s watchers", formatStars(r.WatcherCount)))
+		}
+		if r.CommitCount > 0 {
+			parts = append(parts, fmt.Sprintf("⚡ %d recent commits", r.CommitCount))
+		}
+		if r.DiscoveryScore > 0 {
+			parts = append(parts, fmt.Sprintf("◈ score %.1f", r.DiscoveryScore))
+		}
+		if len(parts) > 0 {
+			enrichedStats = styleDetailMeta.Render(strings.Join(parts, "  "))
+		}
+	}
+	if enrichedStats == "" {
+		enrichedStats = " " // keep layout stable
+	}
+
 	// Topics
 	topics := ""
 	if len(r.Topics) > 0 {
@@ -155,5 +176,5 @@ func (m *detailModel) renderHeader() string {
 
 	sep := styleSubtle.Render(strings.Repeat("─", m.width-2))
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, stats, topics, desc, sep)
+	return lipgloss.JoinVertical(lipgloss.Left, title, stats, enrichedStats, topics, desc, sep)
 }

@@ -38,9 +38,19 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(migration001)
+	if _, err := s.db.Exec(migration001); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(migration002)
 	return err
 }
+
+const migration002 = `
+CREATE TABLE IF NOT EXISTS watchlist (
+	full_name  TEXT PRIMARY KEY,
+	watched_at TEXT DEFAULT (datetime('now'))
+);
+`
 
 const migration001 = `
 CREATE TABLE IF NOT EXISTS repos (

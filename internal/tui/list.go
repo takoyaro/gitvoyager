@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"charm.land/lipgloss/v2"
 	"github.com/takoyaro/gitvoyager/internal/model"
 )
 
@@ -16,11 +17,13 @@ type listModel struct {
 	width    int
 	filter   string
 	seenSet  map[string]bool
+	watchSet map[string]bool
 }
 
 func newListModel() listModel {
 	return listModel{
-		seenSet: make(map[string]bool),
+		seenSet:  make(map[string]bool),
+		watchSet: make(map[string]bool),
 	}
 }
 
@@ -33,6 +36,10 @@ func (m *listModel) SetRepos(repos []model.Repo) {
 
 func (m *listModel) SetSeen(seen map[string]bool) {
 	m.seenSet = seen
+}
+
+func (m *listModel) SetWatched(watched map[string]bool) {
+	m.watchSet = watched
 }
 
 func (m *listModel) SetSize(w, h int) {
@@ -181,9 +188,11 @@ func (m *listModel) renderItem(r model.Repo, selected bool) string {
 		name = name[:nameWidth-1] + "…"
 	}
 
-	// Seen indicator
+	// Status indicator: ♥ watched > · seen > space
 	prefix := " "
-	if m.seenSet[r.FullName] {
+	if m.watchSet[r.FullName] {
+		prefix = lipgloss.NewStyle().Foreground(colorError).Render("♥")
+	} else if m.seenSet[r.FullName] {
 		prefix = styleSubtle.Render("·")
 	}
 

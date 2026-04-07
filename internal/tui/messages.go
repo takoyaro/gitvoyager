@@ -71,6 +71,16 @@ type searchHistoryItem struct {
 	SearchedAt  string // relative time string
 }
 
+// Watchlist
+type watchlistLoadedMsg struct {
+	WatchSet map[string]bool
+}
+
+type watchToggledMsg struct {
+	FullName string
+	Watched  bool
+}
+
 // Timer for status auto-clear
 func clearStatusAfter(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg {

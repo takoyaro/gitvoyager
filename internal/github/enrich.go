@@ -56,11 +56,11 @@ func (c *Client) EnrichRepo(ctx context.Context, repo model.Repo) (model.Repo, e
 	}
 
 	repo.Topics = topics
-	repo.Enriched = true
-
-	if r.LatestRelease != nil {
-		repo.Topics = topics // already set above, but keeping for clarity
+	repo.WatcherCount = r.Watchers.TotalCount
+	if r.DefaultBranchRef != nil {
+		repo.CommitCount = r.DefaultBranchRef.Target.History.TotalCount
 	}
+	repo.Enriched = true
 
 	return repo, nil
 }
