@@ -10,95 +10,150 @@ import (
 )
 
 type statusBarModel struct {
-	width     int
-	message   string
-	isError   bool
-	rateLimit github.RateLimit
-	repoCount int
-	filtered  int
+	width      int
+	message    string
+	isError    bool
+	rateLimit  github.RateLimit
+	repoCount  int
+	filtered   int
+	loading    bool
+	spinFrame  int
+	focusLabel string
 }
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func newStatusBar() statusBarModel {
 	return statusBarModel{}
 }
 
-func (m *statusBarModel) SetWidth(w int) {
-	m.width = w
-}
-
-func (m *statusBarModel) SetMessage(msg string, isError bool) {
-	m.message = msg
-	m.isError = isError
-}
-
-func (m *statusBarModel) ClearMessage() {
-	m.message = ""
-	m.isError = false
-}
-
-func (m *statusBarModel) SetRateLimit(rl github.RateLimit) {
-	m.rateLimit = rl
-}
+func (m *statusBarModel) SetWidth(w int)                      { m.width = w }
+func (m *statusBarModel) SetMessage(msg string, isError bool)  { m.message = msg; m.isError = isError }
+func (m *statusBarModel) ClearMessage()                        { m.message = ""; m.isError = false }
+func (m *statusBarModel) SetRateLimit(rl github.RateLimit)     { m.rateLimit = rl }
+func (m *statusBarModel) SetLoading(v bool)                    { m.loading = v }
+func (m *statusBarModel) SetFocusLabel(label string)           { m.focusLabel = label }
 
 func (m *statusBarModel) SetCounts(total, filtered int) {
 	m.repoCount = total
 	m.filtered = filtered
 }
 
+func (m *statusBarModel) Tick() {
+	m.spinFrame = (m.spinFrame + 1) % len(spinnerFrames)
+}
+
 func (m *statusBarModel) View() string {
-	// Left side: message or hints
-	left := ""
+	sep := styleMuted.Render(" │ ")
+
+	// ── Zone 1: state dot + message ──
+	var zone1 string
 	if m.message != "" {
 		if m.isError {
-			left = styleError.Render(" " + m.message)
+			zone1 = lipgloss.NewStyle().Foreground(colorRedAlert).Render("● ") +
+				styleError.Render(m.message)
+		} else if m.loading {
+			zone1 = styleCyan.Render(spinnerFrames[m.spinFrame]+" ") +
+				styleCyan.Render(m.message)
 		} else {
-			left = styleSuccess.Render(" " + m.message)
+			zone1 = lipgloss.NewStyle().Foreground(colorGreenGrow).Render("● ") +
+				styleSuccess.Render(m.message)
 		}
+	} else if m.loading {
+		zone1 = styleCyan.Render(spinnerFrames[m.spinFrame]+" ") +
+			styleCyan.Render("searching…")
 	} else {
-		left = styleSubtle.Render(" j/k:nav  /:search  s:sort  o:open  c:clone  ?:help")
+		zone1 = lipgloss.NewStyle().Foreground(colorGreenGrow).Render("● ") +
+			styleMuted.Render("j/k:nav  tab:pane  /:search  s:sort  o:open  c:clone  ?:help")
 	}
 
-	// Right side: rate limit + count
-	right := ""
-	parts := []string{}
-
+	// ── Zone 2: repo count ──
+	var zone2 string
 	if m.repoCount > 0 {
+		icon := stylePulse.Render("⚡ ")
 		if m.filtered < m.repoCount {
-			parts = append(parts, fmt.Sprintf("%d/%d repos", m.filtered, m.repoCount))
+			zone2 = icon + stylePrimary.Render(fmt.Sprintf("%d/%d", m.filtered, m.repoCount))
 		} else {
-			parts = append(parts, fmt.Sprintf("%d repos", m.repoCount))
+			zone2 = icon + stylePrimary.Render(fmt.Sprintf("%d", m.repoCount))
 		}
 	}
 
+	// ── Zone 3: rate limit bar ──
+	var zone3 string
 	if m.rateLimit.SearchLimit > 0 {
-		rlColor := colorSuccess
 		remaining := m.rateLimit.SearchRemaining
-		if remaining <= 5 {
-			rlColor = colorError
-		} else if remaining <= 15 {
-			rlColor = colorStar
+		limit := m.rateLimit.SearchLimit
+
+		// 10-cell bar
+		filled := 10
+		if limit > 0 {
+			filled = remaining * 10 / limit
 		}
-		rlStyle := lipgloss.NewStyle().Foreground(rlColor)
+		if filled > 10 {
+			filled = 10
+		}
+
+		barColor := colorGreenGrow
+		if remaining <= 5 {
+			barColor = colorRedAlert
+		} else if remaining <= 15 {
+			barColor = colorGoldStar
+		}
+
+		bar := lipgloss.NewStyle().Foreground(barColor).Render(strings.Repeat("█", filled)) +
+			styleGhost.Render(strings.Repeat("░", 10-filled))
+
 		resetIn := time.Until(m.rateLimit.SearchReset).Round(time.Second)
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		parts = append(parts, rlStyle.Render(
-			fmt.Sprintf("API: %d/%d (reset %s)", remaining, m.rateLimit.SearchLimit, resetIn),
-		))
+
+		zone3 = styleMuted.Render("API ") + bar +
+			styleMuted.Render(fmt.Sprintf(" %d/%d ", remaining, limit)) +
+			styleMuted.Render(fmt.Sprintf("resets %s", formatDuration(resetIn)))
 	}
 
-	if len(parts) > 0 {
-		right = strings.Join(parts, "  ")
+	// ── Zone 0: focus breadcrumb ──
+	var zone0 string
+	if m.focusLabel != "" {
+		zone0 = styleFocusPill.Render(m.focusLabel)
 	}
 
-	// Pad between left and right
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
-	if gap < 1 {
-		gap = 1
+	// ── Compose bar ──
+	var parts []string
+	if zone0 != "" {
+		parts = append(parts, zone0)
+	}
+	parts = append(parts, zone1)
+	if zone2 != "" {
+		parts = append(parts, zone2)
+	}
+	if zone3 != "" {
+		parts = append(parts, zone3)
 	}
 
-	return styleStatusBar.Width(m.width).Render(
-		left + strings.Repeat(" ", gap) + right,
-	)
+	left := strings.Join(parts, sep)
+	leftW := lipgloss.Width(left)
+
+	gap := m.width - leftW - 1
+	if gap < 0 {
+		gap = 0
+	}
+
+	return lipgloss.NewStyle().
+		PaddingLeft(1).
+		Width(m.width).
+		Render(left + strings.Repeat(" ", gap))
+}
+
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "now"
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	if m > 0 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
