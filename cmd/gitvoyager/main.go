@@ -23,6 +23,12 @@ var (
 )
 
 func main() {
+	// Intercept subcommands before flag parsing
+	if len(os.Args) > 1 && os.Args[1] == "data" {
+		runDataCLI(os.Args[2:])
+		return
+	}
+
 	var (
 		query      string
 		versionFlg bool
@@ -32,6 +38,30 @@ func main() {
 	flag.StringVar(&query, "q", "", "initial search query (shorthand)")
 	flag.BoolVar(&versionFlg, "version", false, "print version")
 	flag.BoolVar(&versionFlg, "v", false, "print version (shorthand)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `GitVoyager — discover GitHub repos from your terminal
+
+Usage:
+  gitvoyager [flags] [query...]
+  gitvoyager data <command> [flags]
+
+Flags:
+  -q, -query string   Initial search query
+  -v, -version         Print version and exit
+
+Subcommands:
+  data    Query your local discovery database (repos, watchlist, searches, etc.)
+          Run 'gitvoyager data --help' for details.
+
+Examples:
+  gitvoyager "mcp server"
+  gitvoyager -q "bubble tea"
+  gitvoyager data repos --table --language Go
+  gitvoyager data stats | jq .
+`)
+	}
+
 	flag.Parse()
 
 	if versionFlg {
@@ -54,7 +84,7 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	st, err := store.New(config.DBPath())
+	st, err := store.New(config.DBPath(), &cfg.Exclusions)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
