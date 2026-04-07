@@ -38,6 +38,7 @@ type Repo struct {
 	// Computed scores (populated after fetch)
 	UnderdogScore   float64 // forks+issues relative to stars
 	DiscoveryScore  float64 // multi-signal, age-normalised
+	FreshnessScore  float64 // quality-weighted signal for brand-new repos
 	StarPercentile  int     // 0–10, percentile rank within result set
 
 	// Local tracking
@@ -59,6 +60,14 @@ const (
 
 var SortCycle = []SortField{SortStars, SortUpdated, SortForks, SortBestMatch, SortScore}
 
+// PostFilter names a two-phase post-fetch scoring/filtering strategy.
+type PostFilter string
+
+const (
+	PostFilterNone        PostFilter = ""
+	PostFilterFreshSignal PostFilter = "fresh-signal"
+)
+
 type SearchParams struct {
 	Query           string
 	Topics          []string
@@ -69,7 +78,8 @@ type SearchParams struct {
 	Limit           int
 	GoodFirstIssues string // ">=5"
 	Created         string // date filter, e.g. ">2026-01-01"
-	MaxPushedAge    time.Duration // post-fetch filter: drop repos not pushed within this duration
+	MaxPushedAge    time.Duration  // post-fetch filter: drop repos not pushed within this duration
+	PostFilter      PostFilter     // two-phase scoring/filtering applied after fetch
 }
 
 func DefaultSearchParams() SearchParams {
@@ -93,6 +103,9 @@ func GetPresets() []Preset {
 	now := time.Now()
 	monthAgo := now.AddDate(0, -1, 0).Format("2006-01-02")
 	weekAgo := now.AddDate(0, 0, -7).Format("2006-01-02")
+	twoWeeksAgo := now.AddDate(0, 0, -14).Format("2006-01-02")
+	threeDaysAgo := now.AddDate(0, 0, -3).Format("2006-01-02")
+	threeMonthsAgo := now.AddDate(0, -3, 0).Format("2006-01-02")
 	return []Preset{
 		{
 			Key:         "1",
@@ -120,15 +133,15 @@ func GetPresets() []Preset {
 		},
 		{
 			Key:         "3",
-			Name:        "Help Wanted",
-			Description: "Welcoming repos actively seeking contributors",
+			Name:        "Fresh Signal",
+			Description: "Brand new repos already showing signs of life",
 			Params: SearchParams{
-				Query:           fmt.Sprintf("stars:10..500 pushed:>%s", weekAgo),
-				GoodFirstIssues: ">=5",
-				Sort:            SortUpdated,
-				Order:           "desc",
-				Limit:           50,
-				MaxPushedAge:    14 * 24 * time.Hour, // 2 weeks
+				Query:        fmt.Sprintf("stars:1..50 created:>%s pushed:>%s fork:false", twoWeeksAgo, threeDaysAgo),
+				Sort:         SortUpdated,
+				Order:        "desc",
+				Limit:        80,
+				MaxPushedAge: 7 * 24 * time.Hour, // 1 week
+				PostFilter:   PostFilterFreshSignal,
 			},
 		},
 		{
@@ -141,6 +154,18 @@ func GetPresets() []Preset {
 				Order:        "desc",
 				Limit:        50,
 				MaxPushedAge: 60 * 24 * time.Hour, // 2 months
+			},
+		},
+		{
+			Key:         "5",
+			Name:        "Rising Stars",
+			Description: "Fastest star velocity this week",
+			Params: SearchParams{
+				Query:        fmt.Sprintf("stars:>10 pushed:>%s created:>%s", weekAgo, threeMonthsAgo),
+				Sort:         SortStars,
+				Order:        "desc",
+				Limit:        100,
+				MaxPushedAge: 14 * 24 * time.Hour, // 2 weeks
 			},
 		},
 	}
@@ -197,4 +222,77 @@ func SortByScore(repos []Repo) {
 	sort.Slice(repos, func(i, j int) bool {
 		return repos[i].DiscoveryScore > repos[j].DiscoveryScore
 	})
+}
+
+// ApplyFreshSignalFilter scores repos on quality/freshness signals, sorts by
+// that score, and drops anything below a minimum quality threshold.
+// This is the two-phase filter for the "Fresh Signal" preset.
+func ApplyFreshSignalFilter(repos []Repo) []Repo {
+	now := time.Now()
+	for i := range repos {
+		repos[i].FreshnessScore = freshnessScore(&repos[i], now)
+	}
+	sort.Slice(repos, func(i, j int) bool {
+		return repos[i].FreshnessScore > repos[j].FreshnessScore
+	})
+	// Drop repos that lack minimum quality signals.
+	const threshold = 4.0
+	filtered := repos[:0]
+	for _, r := range repos {
+		if r.FreshnessScore >= threshold {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered
+}
+
+// freshnessScore produces a quality-weighted signal for brand-new repos.
+// Higher = more interesting. Rewards: description, license, language, early
+// traction (stars/forks/issues), very recent pushes, and youth.
+func freshnessScore(r *Repo, now time.Time) float64 {
+	score := 0.0
+
+	// Quality signals — is this a real project?
+	if r.Description != "" {
+		score += 2.0
+	}
+	if r.License != "" {
+		score += 1.5
+	}
+	if r.Language != "" {
+		score += 1.0
+	}
+	if !r.IsFork {
+		score += 1.0
+	}
+	if !r.IsArchived {
+		score += 0.5
+	}
+
+	// Early traction (capped so a single signal can't dominate)
+	if r.Stars > 0 {
+		score += math.Min(math.Log(float64(r.Stars)+1)*1.5, 5.0)
+	}
+	if r.Forks > 0 {
+		score += math.Min(math.Log(float64(r.Forks)+1)*2.0, 4.0)
+	}
+	if r.OpenIssues > 0 {
+		score += math.Min(math.Log(float64(r.OpenIssues)+1)*1.0, 2.0)
+	}
+
+	// Push recency — strong bonus for very recent pushes, decays over days
+	hoursSincePush := now.Sub(r.PushedAt).Hours()
+	if hoursSincePush < 1 {
+		hoursSincePush = 1
+	}
+	score += 3.0 / (hoursSincePush/24.0 + 1.0)
+
+	// Youth bonus — newer repos are more interesting in this context
+	daysSinceCreated := now.Sub(r.CreatedAt).Hours() / 24
+	if daysSinceCreated < 1 {
+		daysSinceCreated = 1
+	}
+	score += 2.0 / (daysSinceCreated/7.0 + 1.0)
+
+	return score
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,4 +94,25 @@ func (c *Client) CloneRepo(ctx context.Context, repoFullName, dir string) error 
 		return fmt.Errorf("clone %s: %s: %w", repoFullName, stderr.String(), err)
 	}
 	return nil
+}
+
+// FetchStarredRepos returns the full names of repos the authenticated user has starred.
+func (c *Client) FetchStarredRepos(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	out, err := c.run(ctx, "api", "user/starred",
+		"--paginate", "-L", fmt.Sprintf("%d", limit),
+		"--jq", ".[].full_name")
+	if err != nil {
+		return nil, err
+	}
+
+	var repos []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			repos = append(repos, line)
+		}
+	}
+	return repos, nil
 }

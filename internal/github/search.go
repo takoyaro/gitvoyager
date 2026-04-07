@@ -103,5 +103,10 @@ func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]
 		repos = filtered
 	}
 
+	// Two-phase post-filter: score and re-rank results based on quality signals.
+	if params.PostFilter == model.PostFilterFreshSignal {
+		repos = model.ApplyFreshSignalFilter(repos)
+	}
+
 	return repos, nil
 }
