@@ -13,6 +13,20 @@ type Config struct {
 	Cache   CacheConfig   `toml:"cache"`
 	Display DisplayConfig `toml:"display"`
 	Clone   CloneConfig   `toml:"clone"`
+	Claude  ClaudeConfig  `toml:"claude"`
+	Local   LocalConfig   `toml:"local"`
+}
+
+type LocalConfig struct {
+	Enabled   bool     `toml:"enabled"`
+	ScanPaths []string `toml:"scan_paths"`
+	AutoScan  bool     `toml:"auto_scan"`
+}
+
+type ClaudeConfig struct {
+	Enabled        bool   `toml:"enabled"`
+	Model          string `toml:"model"`
+	TimeoutSeconds int    `toml:"timeout_seconds"`
 }
 
 type SearchConfig struct {
@@ -51,6 +65,16 @@ func Default() *Config {
 		},
 		Clone: CloneConfig{
 			Protocol: "ssh",
+		},
+		Claude: ClaudeConfig{
+			Enabled:        true,
+			Model:          "haiku",
+			TimeoutSeconds: 30,
+		},
+		Local: LocalConfig{
+			Enabled:   false, // opt-in
+			ScanPaths: []string{"~/Projects"},
+			AutoScan:  false,
 		},
 	}
 }
