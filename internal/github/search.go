@@ -39,6 +39,9 @@ func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]
 	if params.GoodFirstIssues != "" {
 		args = append(args, "--good-first-issues="+params.GoodFirstIssues)
 	}
+	if params.Created != "" {
+		args = append(args, "--created="+params.Created)
+	}
 	if params.Order != "" {
 		args = append(args, "--order="+params.Order)
 	}
@@ -85,6 +88,19 @@ func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]
 			PushedAt:     r.PushedAt,
 			DiscoveredAt: now,
 		}
+	}
+
+	// Post-fetch filter: drop repos that haven't been pushed within MaxPushedAge.
+	// GitHub search doesn't always honor the pushed: qualifier reliably.
+	if params.MaxPushedAge > 0 {
+		cutoff := now.Add(-params.MaxPushedAge)
+		filtered := repos[:0]
+		for _, r := range repos {
+			if !r.PushedAt.IsZero() && r.PushedAt.After(cutoff) {
+				filtered = append(filtered, r)
+			}
+		}
+		repos = filtered
 	}
 
 	return repos, nil

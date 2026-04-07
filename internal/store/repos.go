@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"time"
 
 	"github.com/takoyaro/gitvoyager/internal/model"
@@ -8,18 +9,18 @@ import (
 
 func (s *Store) UpsertRepo(r model.Repo) error {
 	_, err := s.db.Exec(`
-		INSERT INTO repos (full_name, owner, name, description, language, stars, forks, license, is_archived, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos (full_name, owner, name, description, language, stars, forks, license, is_archived, created_at, updated_at, first_seen_stars)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(full_name) DO UPDATE SET
-			description = excluded.description,
-			language = excluded.language,
-			stars = excluded.stars,
-			forks = excluded.forks,
-			license = excluded.license,
-			is_archived = excluded.is_archived,
-			updated_at = excluded.updated_at
+			description    = excluded.description,
+			language       = excluded.language,
+			stars          = excluded.stars,
+			forks          = excluded.forks,
+			license        = excluded.license,
+			is_archived    = excluded.is_archived,
+			updated_at     = excluded.updated_at
 	`, r.FullName, r.Owner, r.Name, r.Description, r.Language, r.Stars, r.Forks,
-		r.License, r.IsArchived, r.CreatedAt.Format(time.RFC3339), r.UpdatedAt.Format(time.RFC3339))
+		r.License, r.IsArchived, r.CreatedAt.Format(time.RFC3339), r.UpdatedAt.Format(time.RFC3339), r.Stars)
 	return err
 }
 
@@ -31,16 +32,16 @@ func (s *Store) UpsertRepos(repos []model.Repo) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO repos (full_name, owner, name, description, language, stars, forks, license, is_archived, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO repos (full_name, owner, name, description, language, stars, forks, license, is_archived, created_at, updated_at, first_seen_stars)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(full_name) DO UPDATE SET
-			description = excluded.description,
-			language = excluded.language,
-			stars = excluded.stars,
-			forks = excluded.forks,
-			license = excluded.license,
-			is_archived = excluded.is_archived,
-			updated_at = excluded.updated_at
+			description    = excluded.description,
+			language       = excluded.language,
+			stars          = excluded.stars,
+			forks          = excluded.forks,
+			license        = excluded.license,
+			is_archived    = excluded.is_archived,
+			updated_at     = excluded.updated_at
 	`)
 	if err != nil {
 		return err
@@ -50,7 +51,7 @@ func (s *Store) UpsertRepos(repos []model.Repo) error {
 	for _, r := range repos {
 		_, err := stmt.Exec(r.FullName, r.Owner, r.Name, r.Description, r.Language,
 			r.Stars, r.Forks, r.License, r.IsArchived,
-			r.CreatedAt.Format(time.RFC3339), r.UpdatedAt.Format(time.RFC3339))
+			r.CreatedAt.Format(time.RFC3339), r.UpdatedAt.Format(time.RFC3339), r.Stars)
 		if err != nil {
 			return err
 		}
@@ -120,4 +121,76 @@ func (s *Store) GetSeenRepos() (map[string]time.Time, error) {
 		seen[name] = t
 	}
 	return seen, rows.Err()
+}
+
+// GetFirstSeenStars returns the first-recorded star count for each given repo.
+// Used to compute star velocity deltas.
+func (s *Store) GetFirstSeenStars(fullNames []string) (map[string]int, error) {
+	if len(fullNames) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat("?,", len(fullNames))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	args := make([]any, len(fullNames))
+	for i, n := range fullNames {
+		args[i] = n
+	}
+
+	rows, err := s.db.Query(
+		`SELECT full_name, COALESCE(first_seen_stars, stars) FROM repos WHERE full_name IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]int, len(fullNames))
+	for rows.Next() {
+		var name string
+		var first int
+		if err := rows.Scan(&name, &first); err != nil {
+			return nil, err
+		}
+		result[name] = first
+	}
+	return result, rows.Err()
+}
+
+// GetWatchlistRepos returns full repo data for all watched repos, with StarDelta pre-computed.
+func (s *Store) GetWatchlistRepos() ([]model.Repo, error) {
+	rows, err := s.db.Query(`
+		SELECT r.full_name, r.owner, r.name, r.description, r.language,
+		       r.stars, r.forks, r.license, r.is_archived, r.created_at, r.updated_at,
+		       COALESCE(r.first_seen_stars, r.stars)
+		FROM repos r
+		JOIN watchlist w ON r.full_name = w.full_name
+		ORDER BY w.watched_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var repos []model.Repo
+	for rows.Next() {
+		var r model.Repo
+		var createdAt, updatedAt string
+		var isArchived, firstSeenStars int
+		if err := rows.Scan(
+			&r.FullName, &r.Owner, &r.Name, &r.Description, &r.Language,
+			&r.Stars, &r.Forks, &r.License, &isArchived, &createdAt, &updatedAt,
+			&firstSeenStars,
+		); err != nil {
+			return nil, err
+		}
+		r.IsArchived = isArchived == 1
+		r.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		r.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		r.Watchlisted = true
+		r.StarDelta = r.Stars - firstSeenStars
+		repos = append(repos, r)
+	}
+	return repos, rows.Err()
 }

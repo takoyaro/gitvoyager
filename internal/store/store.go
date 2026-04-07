@@ -9,6 +9,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+
+
 type Store struct {
 	db *sql.DB
 }
@@ -41,7 +43,32 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(migration001); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(migration002)
+	if _, err := s.db.Exec(migration002); err != nil {
+		return err
+	}
+	return s.migration003()
+}
+
+// migration003 adds first_seen_stars for tracking star velocity.
+// Uses addColumnIfNotExists so it's safe to run multiple times.
+func (s *Store) migration003() error {
+	if err := s.addColumnIfNotExists("repos", "first_seen_stars", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	// Seed existing rows: treat their current star count as the baseline.
+	_, err := s.db.Exec(`UPDATE repos SET first_seen_stars = stars WHERE first_seen_stars = 0 AND stars > 0`)
+	return err
+}
+
+func (s *Store) addColumnIfNotExists(table, column, def string) error {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, def))
 	return err
 }
 
