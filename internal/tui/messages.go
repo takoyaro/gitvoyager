@@ -6,6 +6,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/takoyaro/gitvoyager/internal/github"
 	"github.com/takoyaro/gitvoyager/internal/model"
+	"github.com/takoyaro/gitvoyager/internal/taste"
 )
 
 // Search
@@ -99,9 +100,60 @@ type starDeltasLoadedMsg struct {
 type spinnerTickMsg struct{}
 type rateLimitTickMsg struct{}
 
+// Peek cascade tick
+type peekRevealTickMsg struct{}
+
+// First-launch animation tick
+type firstLaunchTickMsg struct{}
+
 // Return visit
 type returnVisitMsg struct {
 	Repos []model.Repo
+}
+
+// Taste profile
+type tasteProfileMsg struct {
+	Profile taste.Profile
+}
+
+type surprisePickMsg struct {
+	Repo *model.Repo
+}
+
+// Local intelligence
+type localScanMsg struct {
+	ProjectCount int
+	DepCount     int
+	Err          error
+}
+
+// Claude AI
+type claudeSummaryMsg struct {
+	FullName string
+	Summary  string
+	Err      error
+}
+
+type claudeNLSearchMsg struct {
+	Params  model.SearchParams
+	Display string // human-readable version of the generated query
+	Err     error
+}
+
+type claudeAnalysisMsg struct {
+	FullName string
+	Analysis string
+	Err      error
+}
+
+type starredReposSyncedMsg struct {
+	Count int
+	Err   error
+}
+
+type topicDriftMsg struct {
+	Topics []string
+	Err    error
 }
 
 // Session quit

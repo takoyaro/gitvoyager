@@ -9,10 +9,11 @@ import (
 )
 
 type peekModel struct {
-	active bool
-	repo   *model.Repo
-	width  int
-	height int
+	active      bool
+	repo        *model.Repo
+	width       int
+	height      int
+	revealPhase int // 0-5 cascade animation phase
 }
 
 func (m *peekModel) SetSize(w, h int) {
@@ -23,10 +24,21 @@ func (m *peekModel) SetSize(w, h int) {
 func (m *peekModel) Show(r *model.Repo) {
 	m.repo = r
 	m.active = true
+	m.revealPhase = 0 // start cascade
 }
 
 func (m *peekModel) Hide() {
 	m.active = false
+	m.revealPhase = 0
+}
+
+// Tick advances the reveal cascade. Returns true if still animating.
+func (m *peekModel) Tick() bool {
+	if !m.active || m.revealPhase >= 5 {
+		return false
+	}
+	m.revealPhase++
+	return m.revealPhase < 5
 }
 
 func (m *peekModel) IsActive() bool {
@@ -47,51 +59,53 @@ func (m *peekModel) View() string {
 		innerW = m.width - 4
 	}
 
+	phase := m.revealPhase
 	var lines []string
 
-	// Title
+	// Phase 0+: Title (always shown)
 	owner := lipgloss.NewStyle().Italic(true).Foreground(colorFgMuted).Render(r.Owner + "/")
 	name := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render(r.Name)
 	lines = append(lines, owner+name)
 	lines = append(lines, "")
 
-	// Stats
-	starLine := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
-	if r.StarDelta > 0 {
-		starLine += styleSuccess.Render(fmt.Sprintf("  ▲+%d", r.StarDelta))
-	} else if r.StarDelta < 0 {
-		starLine += styleError.Render(fmt.Sprintf("  ▼%d", r.StarDelta))
+	// Phase 1+: Stats
+	if phase >= 1 {
+		starLine := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
+		if r.StarDelta > 0 {
+			starLine += styleSuccess.Render(fmt.Sprintf("  ▲+%d", r.StarDelta))
+		} else if r.StarDelta < 0 {
+			starLine += styleError.Render(fmt.Sprintf("  ▼%d", r.StarDelta))
+		}
+		lines = append(lines, starLine)
+
+		forkLine := styleMuted.Render(fmt.Sprintf("⑂ %s forks  ◉ %d issues", formatStars(r.Forks), r.OpenIssues))
+		lines = append(lines, forkLine)
+
+		metaParts := []string{}
+		if r.Language != "" {
+			metaParts = append(metaParts, styleLang.Foreground(langColor(r.Language)).Render("● "+r.Language))
+		}
+		if r.License != "" {
+			metaParts = append(metaParts, styleMuted.Render("◎ "+r.License))
+		}
+		if len(metaParts) > 0 {
+			lines = append(lines, strings.Join(metaParts, "  "))
+		}
+
+		pushed := formatAgeChip(r.PushedAt)
+		lines = append(lines, styleMuted.Render("Updated ")+pushed)
 	}
-	lines = append(lines, starLine)
 
-	forkLine := styleMuted.Render(fmt.Sprintf("⑂ %s forks  ◉ %d issues", formatStars(r.Forks), r.OpenIssues))
-	lines = append(lines, forkLine)
-
-	// Language + license
-	metaParts := []string{}
-	if r.Language != "" {
-		metaParts = append(metaParts, styleLang.Foreground(langColor(r.Language)).Render("● "+r.Language))
-	}
-	if r.License != "" {
-		metaParts = append(metaParts, styleMuted.Render("◎ "+r.License))
-	}
-	if len(metaParts) > 0 {
-		lines = append(lines, strings.Join(metaParts, "  "))
+	// Phase 2+: Meter + score
+	if phase >= 2 {
+		meter := renderStarMeter(r.StarPercentile)
+		score := styleCyan.Render(fmt.Sprintf("  ◈ %.1f", r.DiscoveryScore))
+		lines = append(lines, meter+score)
+		lines = append(lines, "")
 	}
 
-	// Age
-	pushed := formatAgeChip(r.PushedAt)
-	lines = append(lines, styleMuted.Render("Updated ")+pushed)
-
-	// Star meter + score
-	meter := renderStarMeter(r.StarPercentile)
-	score := styleCyan.Render(fmt.Sprintf("  ◈ %.1f", r.DiscoveryScore))
-	lines = append(lines, meter+score)
-
-	lines = append(lines, "")
-
-	// Description
-	if r.Description != "" {
+	// Phase 3+: Description
+	if phase >= 3 && r.Description != "" {
 		desc := r.Description
 		if len(desc) > innerW-2 {
 			desc = desc[:innerW-5] + "..."
@@ -99,20 +113,19 @@ func (m *peekModel) View() string {
 		lines = append(lines, stylePrimary.Render(desc))
 	}
 
-	// Topics
-	if len(r.Topics) > 0 {
-		lines = append(lines, "")
-		var tags []string
-		for _, t := range r.Topics {
-			tags = append(tags, styleTopicInline.Render("["+t+"]"))
+	// Phase 4+: Topics + hint
+	if phase >= 4 {
+		if len(r.Topics) > 0 {
+			lines = append(lines, "")
+			var tags []string
+			for _, t := range r.Topics {
+				tags = append(tags, styleTopicInline.Render("["+t+"]"))
+			}
+			lines = append(lines, strings.Join(tags, " "))
 		}
-		topicLine := strings.Join(tags, " ")
-		lines = append(lines, topicLine)
+		lines = append(lines, "")
+		lines = append(lines, styleMuted.Render("space/q/esc: close  enter: full detail  w: watch  o: open"))
 	}
-
-	// Hint
-	lines = append(lines, "")
-	lines = append(lines, styleMuted.Render("space/q/esc: close  enter: full detail  w: watch  o: open"))
 
 	inner := lipgloss.JoinVertical(lipgloss.Left, lines...)
 

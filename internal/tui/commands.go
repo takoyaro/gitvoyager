@@ -8,9 +8,12 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/takoyaro/gitvoyager/internal/claude"
 	"github.com/takoyaro/gitvoyager/internal/github"
+	"github.com/takoyaro/gitvoyager/internal/local"
 	"github.com/takoyaro/gitvoyager/internal/model"
 	"github.com/takoyaro/gitvoyager/internal/store"
+	"github.com/takoyaro/gitvoyager/internal/taste"
 )
 
 func searchReposCmd(client *github.Client, st *store.Store, params model.SearchParams) tea.Cmd {
@@ -21,6 +24,7 @@ func searchReposCmd(client *github.Client, st *store.Store, params model.SearchP
 		}
 		if st != nil {
 			_ = st.UpsertRepos(repos)
+			_ = st.RecordStarSnapshots(repos)
 		}
 		return searchResultsMsg{Repos: repos, Query: params.Query}
 	}
@@ -246,6 +250,121 @@ func loadSearchHistoryCmd(st *store.Store) tea.Cmd {
 	}
 }
 
+func computeTasteCmd(engine *taste.Engine) tea.Cmd {
+	return func() tea.Msg {
+		if engine == nil {
+			return tasteProfileMsg{}
+		}
+		// Try cached first
+		if cached, ok := engine.LoadCachedProfile(); ok {
+			return tasteProfileMsg{Profile: cached}
+		}
+		profile, _ := engine.ComputeProfile()
+		return tasteProfileMsg{Profile: profile}
+	}
+}
+
+func surprisePickCmd(engine *taste.Engine, profile taste.Profile) tea.Cmd {
+	return func() tea.Msg {
+		if engine == nil || profile.Empty() {
+			return surprisePickMsg{}
+		}
+		repo, _ := engine.SurprisePick(profile)
+		return surprisePickMsg{Repo: repo}
+	}
+}
+
+func localScanCmd(scanner *local.Scanner, st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if scanner == nil {
+			return localScanMsg{Err: fmt.Errorf("local scanning not configured")}
+		}
+		projects, err := scanner.Scan()
+		if err != nil {
+			return localScanMsg{Err: err}
+		}
+		depCount := 0
+		for _, fp := range projects {
+			if st != nil {
+				_ = st.SaveProjectFingerprint(fp)
+			}
+			depCount += len(fp.Dependencies)
+		}
+		return localScanMsg{ProjectCount: len(projects), DepCount: depCount}
+	}
+}
+
+func claudeSummarizeCmd(client *claude.Client, fullName, readme string) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil || !client.Available() {
+			return claudeSummaryMsg{FullName: fullName, Err: fmt.Errorf("claude not available")}
+		}
+		summary, err := client.SummarizeReadme(context.Background(), fullName, readme)
+		return claudeSummaryMsg{FullName: fullName, Summary: summary, Err: err}
+	}
+}
+
+func claudeNLSearchCmd(client *claude.Client, query string) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil || !client.Available() {
+			return claudeNLSearchMsg{Err: fmt.Errorf("claude not available")}
+		}
+		params, display, err := client.TranslateToSearch(context.Background(), query)
+		return claudeNLSearchMsg{Params: params, Display: display, Err: err}
+	}
+}
+
+func syncStarredReposCmd(gh *github.Client, st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if gh == nil || st == nil {
+			return starredReposSyncedMsg{}
+		}
+		// Check if we synced recently (within 24h)
+		if _, ok := st.GetCached("starred:last_sync"); ok {
+			return starredReposSyncedMsg{}
+		}
+		repos, err := gh.FetchStarredRepos(context.Background(), 200)
+		if err != nil {
+			return starredReposSyncedMsg{Err: err}
+		}
+		// Mark sync timestamp (24h TTL)
+		_ = st.SetCached("starred:last_sync", []byte("1"), 24*time.Hour, "")
+		return starredReposSyncedMsg{Count: len(repos)}
+	}
+}
+
+func topicDriftCmd(client *claude.Client, query string, topics []string) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil || !client.Available() {
+			return topicDriftMsg{}
+		}
+		suggested, err := client.SuggestAdjacentTopics(context.Background(), query, topics)
+		return topicDriftMsg{Topics: suggested, Err: err}
+	}
+}
+
+func claudeWhyTrendingCmd(client *claude.Client, repo model.Repo, readme string) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil || !client.Available() {
+			return claudeAnalysisMsg{FullName: repo.FullName, Err: fmt.Errorf("claude not available")}
+		}
+		analysis, err := client.WhyTrending(context.Background(), repo, readme)
+		return claudeAnalysisMsg{FullName: repo.FullName, Analysis: analysis, Err: err}
+	}
+}
+
+func firstLaunchTickCmd() tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg {
+		return firstLaunchTickMsg{}
+	})
+}
+
+func peekRevealTickCmd() tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		return peekRevealTickMsg{}
+	})
+}
+
 func relativeTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -259,13 +378,13 @@ func relativeTime(t time.Time) string {
 		if m == 1 {
 			return "1m ago"
 		}
-		return time.Duration(m).Truncate(time.Minute).String() + " ago"
+		return fmt.Sprintf("%dm ago", m)
 	case d < 24*time.Hour:
 		h := int(d.Hours())
 		if h == 1 {
 			return "1h ago"
 		}
-		return time.Duration(h).Truncate(time.Hour).String() + " ago"
+		return fmt.Sprintf("%dh ago", h)
 	default:
 		days := int(d.Hours() / 24)
 		if days == 1 {

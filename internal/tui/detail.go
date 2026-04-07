@@ -11,13 +11,6 @@ import (
 	"github.com/takoyaro/gitvoyager/internal/model"
 )
 
-type detailTab int
-
-const (
-	tabOverview detailTab = iota
-	tabReadme
-)
-
 type detailModel struct {
 	viewport viewport.Model
 	repo     *model.Repo
@@ -25,8 +18,12 @@ type detailModel struct {
 	loading  bool
 	width    int
 	height   int
-	tab      detailTab
 	focused  bool
+
+	// Claude AI content (set by app, read by view)
+	aiSummary    string
+	aiAnalysis   string
+	summarizing  bool
 }
 
 func (m *detailModel) SetFocused(v bool) { m.focused = v }
@@ -47,15 +44,33 @@ func (m *detailModel) SetSize(w, h int) {
 }
 
 func (m *detailModel) headerHeight() int {
-	return 8 // border(2) + stats(1) + name(1) + meter+license(1) + topics(1) + tab bar(1) + gap(1)
+	return 7 // border(2) + stats(1) + name(1) + meter+license(1) + topics(1) + gap(1)
 }
 
 func (m *detailModel) SetRepo(r *model.Repo) {
 	m.repo = r
 	m.readme = ""
 	m.loading = true
-	m.tab = tabOverview
+	m.aiSummary = ""
+	m.aiAnalysis = ""
+	m.summarizing = false
 	m.viewport.GotoTop()
+	m.updateContent()
+}
+
+func (m *detailModel) SetAISummary(summary string) {
+	m.aiSummary = summary
+	m.summarizing = false
+	m.updateContent()
+}
+
+func (m *detailModel) SetAIAnalysis(analysis string) {
+	m.aiAnalysis = analysis
+	m.updateContent()
+}
+
+func (m *detailModel) SetSummarizing(v bool) {
+	m.summarizing = v
 	m.updateContent()
 }
 
@@ -75,42 +90,43 @@ func (m *detailModel) SetLoading(v bool) {
 	m.updateContent()
 }
 
-func (m *detailModel) SetTab(t detailTab) {
-	m.tab = t
-	m.viewport.GotoTop()
-	m.updateContent()
-}
-
 func (m *detailModel) updateContent() {
 	if m.repo == nil {
 		m.viewport.SetContent(styleSubtle.Render("  Select a repo to view details"))
 		return
 	}
-
-	switch m.tab {
-	case tabOverview:
-		m.viewport.SetContent(m.renderOverview())
-	case tabReadme:
-		m.viewport.SetContent(m.renderReadmeContent())
-	}
+	m.viewport.SetContent(m.renderCombinedView())
 }
 
-func (m *detailModel) renderOverview() string {
+func (m *detailModel) renderCombinedView() string {
 	r := m.repo
-	var lines []string
+	var sections []string
 
-	// Star count + delta
-	starLine := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
-	if r.StarDelta > 0 {
-		starLine += styleSuccess.Render(fmt.Sprintf("  ▲+%d since first seen", r.StarDelta))
-	} else if r.StarDelta < 0 {
-		starLine += styleError.Render(fmt.Sprintf("  ▼%d since first seen", r.StarDelta))
+	// -- Preamble: metadata not already in header --
+	var meta []string
+
+	// Description
+	if r.Description != "" {
+		desc := r.Description
+		maxW := m.width - 4
+		if len(desc) > maxW {
+			desc = desc[:maxW-3] + "..."
+		}
+		meta = append(meta, stylePrimary.Render("  "+desc))
+		meta = append(meta, "")
 	}
-	lines = append(lines, "  "+starLine)
 
-	// Forks + issues
-	forkIssue := styleMuted.Render(fmt.Sprintf("  ⑂ %s forks  ◉ %d open issues", formatStars(r.Forks), r.OpenIssues))
-	lines = append(lines, forkIssue)
+	// Star delta (header shows count, not delta)
+	if r.StarDelta > 0 {
+		meta = append(meta, "  "+styleSuccess.Render(fmt.Sprintf("▲ +%d stars since first seen", r.StarDelta)))
+	} else if r.StarDelta < 0 {
+		meta = append(meta, "  "+styleError.Render(fmt.Sprintf("▼ %d stars since first seen", r.StarDelta)))
+	}
+
+	// Open issues
+	if r.OpenIssues > 0 {
+		meta = append(meta, styleMuted.Render(fmt.Sprintf("  ◉ %d open issues", r.OpenIssues)))
+	}
 
 	// Enriched stats
 	if r.Enriched {
@@ -122,46 +138,52 @@ func (m *detailModel) renderOverview() string {
 			eParts = append(eParts, fmt.Sprintf("⚡ %d recent commits", r.CommitCount))
 		}
 		if len(eParts) > 0 {
-			lines = append(lines, styleMuted.Render("  "+strings.Join(eParts, "  ")))
+			meta = append(meta, styleMuted.Render("  "+strings.Join(eParts, "  ")))
 		}
 	}
-
-	lines = append(lines, "")
 
 	// Dates
 	created := r.CreatedAt.Format("2006-01-02")
 	pushed := formatAgeChip(r.PushedAt)
-	lines = append(lines, styleMuted.Render(fmt.Sprintf("  Created %s  ·  Updated %s", created, pushed)))
+	meta = append(meta, styleMuted.Render(fmt.Sprintf("  Created %s  ·  Updated %s", created, pushed)))
 
-	// Score
+	// Score bar
 	if r.DiscoveryScore > 0 {
 		bar := renderScoreBar(r.DiscoveryScore, 10)
-		lines = append(lines, "  "+bar)
+		meta = append(meta, "  "+bar)
 	}
 
-	lines = append(lines, "")
-
-	// Description
-	if r.Description != "" {
-		desc := r.Description
-		maxW := m.width - 4
-		if len(desc) > maxW {
-			desc = desc[:maxW-3] + "..."
-		}
-		lines = append(lines, stylePrimary.Render("  "+desc))
+	if len(meta) > 0 {
+		sections = append(sections, lipgloss.JoinVertical(lipgloss.Left, meta...))
 	}
 
-	// Topics
-	if len(r.Topics) > 0 {
-		lines = append(lines, "")
-		var tags []string
-		for _, t := range r.Topics {
-			tags = append(tags, styleTopicInline.Render("["+t+"]"))
-		}
-		lines = append(lines, "  "+strings.Join(tags, " "))
+	// -- AI Summary --
+	if m.aiSummary != "" {
+		aiLabel := styleCyan.Render("  ◎ AI Summary")
+		aiText := stylePrimary.Render("  " + m.aiSummary)
+		sections = append(sections, "", aiLabel, aiText)
+	} else if m.summarizing {
+		sections = append(sections, "", styleCyan.Render("  ◎ Summarizing..."))
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	// -- AI Analysis (Why Trending) --
+	if m.aiAnalysis != "" {
+		aiLabel := stylePulse.Render("  ⚡ Why Trending")
+		aiText := stylePrimary.Render("  " + m.aiAnalysis)
+		sections = append(sections, "", aiLabel, aiText)
+	}
+
+	// -- Separator --
+	sepW := m.width - 6
+	if sepW < 4 {
+		sepW = 4
+	}
+	sections = append(sections, styleMuted.Render("  "+strings.Repeat("─", sepW)))
+
+	// -- README --
+	sections = append(sections, m.renderReadmeContent())
+
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 func (m *detailModel) renderReadmeContent() string {
@@ -191,9 +213,8 @@ func (m *detailModel) renderMarkdown(md string) string {
 
 func (m *detailModel) View() string {
 	header := m.renderHeader()
-	tabBar := m.renderTabBar()
 	vpView := m.viewport.View()
-	return lipgloss.JoinVertical(lipgloss.Left, header, tabBar, vpView)
+	return lipgloss.JoinVertical(lipgloss.Left, header, vpView)
 }
 
 func (m *detailModel) renderHeader() string {
@@ -274,38 +295,6 @@ func (m *detailModel) renderHeader() string {
 		Render(inner)
 
 	return box
-}
-
-func (m *detailModel) renderTabBar() string {
-	tabs := []struct {
-		label string
-		tab   detailTab
-	}{
-		{"Overview", tabOverview},
-		{"README", tabReadme},
-	}
-
-	activeStyle, inactiveStyle := styleTabActiveDimmed, styleTabInactiveDimmed
-	if m.focused {
-		activeStyle, inactiveStyle = styleTabActive, styleTabInactive
-	}
-
-	var parts []string
-	for _, t := range tabs {
-		if t.tab == m.tab {
-			parts = append(parts, activeStyle.Render(" "+t.label+" "))
-		} else {
-			parts = append(parts, inactiveStyle.Render(" "+t.label+" "))
-		}
-	}
-
-	// Tab indicator: shows 1/2 key hints when focused
-	hint := ""
-	if m.focused {
-		hint = styleMuted.Render("  1/2")
-	}
-
-	return " " + strings.Join(parts, " ") + hint
 }
 
 // renderStarMeter returns a ★★★★★☆☆☆☆☆ string for the given percentile (0–10).

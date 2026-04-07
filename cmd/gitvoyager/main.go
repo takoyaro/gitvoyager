@@ -7,9 +7,12 @@ import (
 	"os"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/takoyaro/gitvoyager/internal/claude"
 	"github.com/takoyaro/gitvoyager/internal/config"
 	"github.com/takoyaro/gitvoyager/internal/github"
+	"github.com/takoyaro/gitvoyager/internal/local"
 	"github.com/takoyaro/gitvoyager/internal/store"
+	"github.com/takoyaro/gitvoyager/internal/taste"
 	"github.com/takoyaro/gitvoyager/internal/tui"
 )
 
@@ -58,8 +61,15 @@ func main() {
 	defer st.Close()
 
 	gh := github.NewClient()
+	te := taste.New(st)
+	cl := claude.New(claude.Config(cfg.Claude), st)
 
-	app := tui.NewApp(cfg, st, gh, query)
+	var ls *local.Scanner
+	if cfg.Local.Enabled {
+		ls = local.New(cfg.Local.ScanPaths)
+	}
+
+	app := tui.NewApp(cfg, st, gh, te, cl, ls, query)
 
 	p := tea.NewProgram(app)
 	if _, err := p.Run(); err != nil {

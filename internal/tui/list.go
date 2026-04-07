@@ -22,6 +22,9 @@ type listModel struct {
 	watchSet map[string]bool
 	loading  bool
 	focused  bool
+
+	// Shimmer animation for skeleton loading
+	shimmerFrame int
 }
 
 func newListModel() listModel {
@@ -236,25 +239,59 @@ func (m *listModel) renderScrollbar(trackH int) string {
 	return b.String()
 }
 
+// Tick advances the shimmer animation frame.
+func (m *listModel) Tick() {
+	m.shimmerFrame++
+}
+
 func (m *listModel) renderSkeleton() string {
 	var b strings.Builder
-	// Deterministic "random" block lengths for skeleton rows
 	lengths := [][2]int{{9, 16}, {12, 10}, {7, 18}, {14, 8}, {10, 14}, {8, 12}, {11, 15}, {6, 19}}
 	vis := m.visibleCount()
 	if vis > len(lengths) {
 		vis = len(lengths)
 	}
-	ghost := styleGhost
+
+	// Shimmer wave: a highlight band sweeps left-to-right across the skeleton
+	waveLen := 20   // width of the highlight band in columns
+	wavePos := m.shimmerFrame % (m.width + waveLen*2) // cycle across full width + offscreen
+
 	for i := 0; i < vis; i++ {
 		l := lengths[i]
-		line1 := ghost.Render("  " + strings.Repeat("█", l[0]) + " " + strings.Repeat("█", l[1]))
-		line2 := ghost.Render("       " + strings.Repeat("█", l[1]-3) + "   " + strings.Repeat("█", 5))
+		line1 := m.renderShimmerLine("  "+strings.Repeat("█", l[0])+" "+strings.Repeat("█", l[1]), wavePos, i)
+		line2 := m.renderShimmerLine("       "+strings.Repeat("█", l[1]-3)+"   "+strings.Repeat("█", 5), wavePos, i)
 		b.WriteString(lipgloss.NewStyle().Width(m.width).Render(line1))
 		b.WriteByte('\n')
 		b.WriteString(lipgloss.NewStyle().Width(m.width).Render(line2))
 		if i < vis-1 {
 			b.WriteByte('\n')
 		}
+	}
+	return b.String()
+}
+
+// renderShimmerLine renders a skeleton line with a sweeping highlight wave.
+// Characters inside the wave band are rendered brighter (colorFgMuted),
+// characters outside are dimmer (colorFgGhost).
+func (m *listModel) renderShimmerLine(text string, wavePos, rowOffset int) string {
+	// Offset the wave slightly per row for a diagonal sweep effect
+	adjustedPos := wavePos - rowOffset*3 - 10 // shift wave left for lower rows
+	waveLen := 20
+
+	var b strings.Builder
+	col := 0
+	for _, ch := range text {
+		if ch == ' ' || ch == '\t' {
+			b.WriteRune(ch)
+		} else {
+			inWave := col >= adjustedPos && col < adjustedPos+waveLen
+			if inWave {
+				b.WriteString(lipgloss.NewStyle().Foreground(colorFgMuted).Render(string(ch)))
+			} else {
+				b.WriteString(lipgloss.NewStyle().Foreground(colorFgGhost).Render(string(ch)))
+			}
+		}
+		col++
 	}
 	return b.String()
 }

@@ -207,28 +207,6 @@ var (
 	styleStarFilled = lipgloss.NewStyle().Foreground(colorGoldStar)
 	styleStarEmpty  = lipgloss.NewStyle().Foreground(colorFgGhost)
 
-	// Tab bar — focused
-	styleTabActive = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(colorFgPrimary).
-			Background(colorAccentViolet).
-			PaddingLeft(1).PaddingRight(1)
-
-	styleTabInactive = lipgloss.NewStyle().
-				Foreground(colorFgMuted).
-				PaddingLeft(1).PaddingRight(1)
-
-	// Tab bar — dimmed (detail pane unfocused)
-	styleTabActiveDimmed = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(colorFgSecondary).
-				Background(colorBgElevated).
-				PaddingLeft(1).PaddingRight(1)
-
-	styleTabInactiveDimmed = lipgloss.NewStyle().
-				Foreground(colorFgGhost).
-				PaddingLeft(1).PaddingRight(1)
-
 	// Focus breadcrumb pills (status bar)
 	styleFocusPill = lipgloss.NewStyle().
 			Foreground(colorFgPrimary).

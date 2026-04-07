@@ -27,6 +27,10 @@ type keyMap struct {
 	Yank          key.Binding
 	YankClone     key.Binding
 	Exclude       key.Binding
+	AISummarize   key.Binding
+	NLSearch      key.Binding
+	WhyTrending   key.Binding
+	Compare       key.Binding
 }
 
 var keys = keyMap{
@@ -126,6 +130,22 @@ var keys = keyMap{
 		key.WithKeys("x"),
 		key.WithHelp("x", "exclude"),
 	),
+	AISummarize: key.NewBinding(
+		key.WithKeys("A"),
+		key.WithHelp("A", "AI summary"),
+	),
+	NLSearch: key.NewBinding(
+		key.WithKeys("n"),
+		key.WithHelp("n", "AI search"),
+	),
+	WhyTrending: key.NewBinding(
+		key.WithKeys("t"),
+		key.WithHelp("t", "why trending?"),
+	),
+	Compare: key.NewBinding(
+		key.WithKeys("C"),
+		key.WithHelp("C", "compare"),
+	),
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
@@ -137,6 +157,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Enter, k.Back},
 		{k.Search, k.AdvancedSearch, k.Sort, k.Filter, k.Tab},
 		{k.Open, k.Clone, k.Watch, k.Watchlist, k.Peek, k.Yank, k.Exclude},
+		{k.AISummarize, k.NLSearch, k.WhyTrending, k.Compare},
 		{k.PageUp, k.PageDn, k.GoTop, k.GoEnd},
 		{k.Help, k.Quit},
 	}

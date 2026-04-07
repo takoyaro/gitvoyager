@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
+	"sort"
 	"strings"
 	"time"
 
@@ -9,10 +11,13 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/takoyaro/gitvoyager/internal/claude"
 	"github.com/takoyaro/gitvoyager/internal/config"
 	"github.com/takoyaro/gitvoyager/internal/github"
+	"github.com/takoyaro/gitvoyager/internal/local"
 	"github.com/takoyaro/gitvoyager/internal/model"
 	"github.com/takoyaro/gitvoyager/internal/store"
+	"github.com/takoyaro/gitvoyager/internal/taste"
 )
 
 type pane int
@@ -44,7 +49,8 @@ type appModel struct {
 	searchForm  searchFormModel
 
 	// Overlays
-	peek peekModel
+	peek    peekModel
+	compare compareModel
 
 	// State
 	repos      []model.Repo
@@ -68,6 +74,10 @@ type appModel struct {
 	watchlistList   listModel
 	watchlistLoading bool
 
+	// First-launch animation
+	firstLaunch      bool
+	firstLaunchFrame int
+
 	// Local sets
 	watchSet   map[string]bool
 	excludeSet map[string]bool // session-ephemeral exclusions
@@ -80,13 +90,29 @@ type appModel struct {
 	// Return visit
 	returnVisitRepos []model.Repo
 
+	// Taste profile
+	tasteEngine  *taste.Engine
+	tasteProfile taste.Profile
+	surprisePick *model.Repo
+
+	// Local intelligence
+	localScanner *local.Scanner
+
+	// Claude AI
+	claude           *claude.Client
+	claudeSummaries  map[string]string // fullName -> summary (in-memory cache)
+	claudeAnalyses   map[string]string // fullName -> analysis
+	nlSearchMode     bool
+	summarizing      bool
+	suggestedTopics  []string // topic drift suggestions
+
 	// Dependencies
 	cfg    *config.Config
 	store  *store.Store
 	github *github.Client
 }
 
-func NewApp(cfg *config.Config, st *store.Store, gh *github.Client, initialQuery string) *appModel {
+func NewApp(cfg *config.Config, st *store.Store, gh *github.Client, te *taste.Engine, cl *claude.Client, ls *local.Scanner, initialQuery string) *appModel {
 	fi := textinput.New()
 	fi.Placeholder = "filter…"
 	fi.Prompt = "  filter: "
@@ -102,10 +128,15 @@ func NewApp(cfg *config.Config, st *store.Store, gh *github.Client, initialQuery
 		watchlistList: newListModel(),
 		searchParams: model.DefaultSearchParams(),
 		watchSet:     make(map[string]bool),
-		excludeSet:   make(map[string]bool),
-		cfg:          cfg,
-		store:        st,
-		github:       gh,
+		excludeSet:      make(map[string]bool),
+		tasteEngine:     te,
+		localScanner:    ls,
+		claude:          cl,
+		claudeSummaries: make(map[string]string),
+		claudeAnalyses:  make(map[string]string),
+		cfg:             cfg,
+		store:           st,
+		github:          gh,
 	}
 
 	if cfg != nil {
@@ -135,7 +166,16 @@ func (m *appModel) Init() tea.Cmd {
 		loadWatchlistCmd(m.store),
 		rateLimitTickCmd(),
 		checkReturnVisitCmd(m.store),
+		computeTasteCmd(m.tasteEngine),
 	}
+
+	// Auto-scan local projects if configured
+	if m.localScanner != nil && m.cfg != nil && m.cfg.Local.Enabled && m.cfg.Local.AutoScan {
+		cmds = append(cmds, localScanCmd(m.localScanner, m.store))
+	}
+
+	// Sync starred repos (debounced, max once per 24h)
+	cmds = append(cmds, syncStarredReposCmd(m.github, m.store))
 
 	if m.searchParams.Query != "" {
 		m.loading = true
@@ -143,17 +183,11 @@ func (m *appModel) Init() tea.Cmd {
 		m.statusBar.SetLoading(true)
 		cmds = append(cmds, searchReposCmd(m.github, m.store, m.searchParams), spinnerTickCmd())
 	} else if m.store != nil {
-		// Auto-trending on first launch: if no search history exists, pre-fire trending
+		// First launch: if no search history, show animated carousel
 		recent, _ := m.store.RecentSearches(1)
 		if len(recent) == 0 {
-			presets := model.GetPresets()
-			if len(presets) > 0 {
-				m.searchParams = presets[0].Params // trending preset
-				m.loading = true
-				m.list.SetLoading(true)
-				m.statusBar.SetLoading(true)
-				cmds = append(cmds, searchReposCmd(m.github, m.store, m.searchParams), spinnerTickCmd())
-			}
+			m.firstLaunch = true
+			cmds = append(cmds, firstLaunchTickCmd())
 		}
 	}
 
@@ -180,6 +214,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
+		m.firstLaunch = false // stop carousel on any keypress
 		return m.handleKey(msg)
 
 	case ghAuthCheckedMsg:
@@ -215,6 +250,8 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, debounceDetailCmd(m.detailTag, 100*time.Millisecond))
 		}
 		cmds = append(cmds, loadStarDeltasCmd(m.store, m.repos))
+		// Clear topic drift for new search
+		m.suggestedTopics = nil
 		return m, tea.Batch(cmds...)
 
 	case starDeltasLoadedMsg:
@@ -243,6 +280,13 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.detail.SetRepo(sel)
+		// Restore cached AI content for this repo
+		if summary, ok := m.claudeSummaries[sel.FullName]; ok {
+			m.detail.SetAISummary(summary)
+		}
+		if analysis, ok := m.claudeAnalyses[sel.FullName]; ok {
+			m.detail.SetAIAnalysis(analysis)
+		}
 		m.sessionViewed++
 		if m.store != nil {
 			_ = m.store.MarkSeen(sel.FullName)
@@ -254,6 +298,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case repoDetailMsg:
+		var cmds []tea.Cmd
 		for i, r := range m.repos {
 			if r.FullName == msg.Repo.FullName {
 				m.repos[i].Topics = msg.Repo.Topics
@@ -274,7 +319,17 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		return m, nil
+		// Trigger topic drift once per search session after first enrichment with topics
+		if len(m.suggestedTopics) == 0 && len(msg.Repo.Topics) > 0 && m.claude != nil && m.claude.Available() {
+			var allTopics []string
+			for _, r := range m.repos {
+				allTopics = append(allTopics, r.Topics...)
+			}
+			if len(allTopics) >= 3 {
+				cmds = append(cmds, topicDriftCmd(m.claude, m.searchParams.Query, allTopics))
+			}
+		}
+		return m, tea.Batch(cmds...)
 
 	case readmeMsg:
 		if sel := m.activeList().Selected(); sel != nil && sel.FullName == msg.FullName {
@@ -291,6 +346,16 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.detail.SetReadme(msg.Content)
+
+			// Auto-summarize with Claude if available and not cached
+			if m.claude != nil && m.claude.Available() && msg.Content != "" {
+				if summary, ok := m.claudeSummaries[msg.FullName]; ok {
+					m.detail.SetAISummary(summary)
+				} else {
+					m.detail.SetSummarizing(true)
+					return m, claudeSummarizeCmd(m.claude, msg.FullName, msg.Content)
+				}
+			}
 		}
 		return m, nil
 
@@ -368,6 +433,10 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.watchlistLoading = false
 		if len(m.watchlistRepos) > 0 {
 			model.ComputeScores(m.watchlistRepos)
+			// Sort by star delta descending (most changed first)
+			sort.Slice(m.watchlistRepos, func(i, j int) bool {
+				return m.watchlistRepos[i].StarDelta > m.watchlistRepos[j].StarDelta
+			})
 			m.watchlistList.SetRepos(m.watchlistRepos)
 			m.watchlistList.SetWatched(m.watchSet)
 			names := make([]string, len(m.watchlistRepos))
@@ -424,12 +493,104 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinnerTickMsg:
 		if m.loading {
 			m.statusBar.Tick()
+			m.list.Tick()
 			return m, spinnerTickCmd()
 		}
 		return m, nil
 
 	case rateLimitTickMsg:
 		return m, rateLimitTickCmd()
+
+	case peekRevealTickMsg:
+		if m.peek.IsActive() && m.peek.Tick() {
+			return m, peekRevealTickCmd()
+		}
+		return m, nil
+
+	case firstLaunchTickMsg:
+		if m.firstLaunch && m.state == stateSearchPrompt {
+			m.firstLaunchFrame++
+			return m, firstLaunchTickCmd()
+		}
+		return m, nil
+
+	case tasteProfileMsg:
+		m.tasteProfile = msg.Profile
+		if !msg.Profile.Empty() {
+			return m, surprisePickCmd(m.tasteEngine, msg.Profile)
+		}
+		return m, nil
+
+	case surprisePickMsg:
+		m.surprisePick = msg.Repo
+		return m, nil
+
+	case localScanMsg:
+		if msg.Err == nil && msg.ProjectCount > 0 {
+			m.statusBar.SetMessage(fmt.Sprintf("Scanned %d projects, %d dependencies", msg.ProjectCount, msg.DepCount), false)
+			// Recompute taste profile with local data
+			return m, tea.Batch(
+				computeTasteCmd(m.tasteEngine),
+				clearStatusAfter(3*time.Second),
+			)
+		}
+		return m, nil
+
+	case claudeSummaryMsg:
+		m.summarizing = false
+		if msg.Err == nil && msg.Summary != "" {
+			m.claudeSummaries[msg.FullName] = msg.Summary
+			if m.detail.repo != nil && m.detail.repo.FullName == msg.FullName {
+				m.detail.SetAISummary(msg.Summary)
+			}
+		} else if m.detail.repo != nil && m.detail.repo.FullName == msg.FullName {
+			m.detail.SetSummarizing(false)
+		}
+		return m, nil
+
+	case claudeNLSearchMsg:
+		if msg.Err != nil {
+			m.statusBar.SetMessage("AI search failed: "+msg.Err.Error(), true)
+			return m, clearStatusAfter(3 * time.Second)
+		}
+		m.nlSearchMode = false
+		m.searchParams = msg.Params
+		m.searchBar.SetQuery(msg.Display)
+		m.statusBar.SetMessage("AI translated: "+msg.Display, false)
+		m.loading = true
+		m.list.SetLoading(true)
+		m.statusBar.SetLoading(true)
+		return m, tea.Batch(
+			searchReposCmd(m.github, m.store, m.searchParams),
+			fetchRateLimitCmd(m.github),
+			spinnerTickCmd(),
+			clearStatusAfter(5*time.Second),
+		)
+
+	case claudeAnalysisMsg:
+		if msg.Err == nil && msg.Analysis != "" {
+			m.claudeAnalyses[msg.FullName] = msg.Analysis
+			if m.detail.repo != nil && m.detail.repo.FullName == msg.FullName {
+				m.detail.SetAIAnalysis(msg.Analysis)
+			}
+			m.statusBar.SetMessage("AI analysis ready", false)
+		} else if msg.Err != nil {
+			m.statusBar.SetMessage("AI analysis failed", true)
+		}
+		return m, clearStatusAfter(3 * time.Second)
+
+	case starredReposSyncedMsg:
+		if msg.Err == nil && msg.Count > 0 {
+			// Recompute taste profile with starred repos data
+			return m, computeTasteCmd(m.tasteEngine)
+		}
+		return m, nil
+
+	case topicDriftMsg:
+		if msg.Err == nil && len(msg.Topics) > 0 {
+			m.suggestedTopics = msg.Topics
+		}
+		return m, nil
 
 	case returnVisitMsg:
 		if len(msg.Repos) > 0 && m.state == stateSearchPrompt && len(m.repos) == 0 {
@@ -476,6 +637,15 @@ func (m *appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, quitTimerCmd()
 		}
 		return m, tea.Quit
+	}
+
+	// Compare overlay captures all keys when active
+	if m.compare.IsActive() {
+		switch {
+		case key.Matches(msg, keys.Escape), msg.String() == "q", msg.String() == "C":
+			m.compare.Hide()
+		}
+		return m, nil
 	}
 
 	// Peek overlay captures all keys when active
@@ -530,6 +700,10 @@ func (m *appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m *appModel) toggleWatchlistState() (tea.Model, tea.Cmd) {
 	if m.state == stateWatchlist {
+		// Stamp last viewed when leaving watchlist
+		if m.store != nil {
+			_ = m.store.UpdateWatchlistViewedAt()
+		}
 		m.state = stateBrowsing
 		m.focus = paneList
 		return m, nil
@@ -566,7 +740,12 @@ func (m *appModel) launchPreset(idx int) (tea.Model, tea.Cmd) {
 	if idx < 0 || idx >= len(presets) {
 		return m, nil
 	}
-	m.searchParams = presets[idx].Params
+	// Personalize preset with taste profile
+	p := presets[idx]
+	if m.tasteEngine != nil && !m.tasteProfile.Empty() {
+		p = m.tasteEngine.PersonalizePreset(p, m.tasteProfile)
+	}
+	m.searchParams = p.Params
 	m.loading = true
 	m.searchBar.Blur()
 	m.focus = paneList
@@ -594,9 +773,27 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.launchPreset(2)
 		case "4":
 			return m.launchPreset(3)
+		case "5":
+			return m.launchPreset(4)
 		case "a":
 			m.formMode = true
 			return m, m.searchForm.Focus()
+		case "S":
+			if m.tasteEngine != nil && !m.tasteProfile.Empty() {
+				return m, surprisePickCmd(m.tasteEngine, m.tasteProfile)
+			}
+		case "n":
+			if m.claude != nil && m.claude.Available() {
+				m.nlSearchMode = !m.nlSearchMode
+				if m.nlSearchMode {
+					m.searchBar.input.Placeholder = "describe what you're looking for..."
+					m.statusBar.SetMessage("AI search mode — describe in plain English", false)
+				} else {
+					m.searchBar.input.Placeholder = "Search repos (e.g. mcp server, language:go, topic:cli)"
+					m.statusBar.ClearMessage()
+				}
+				return m, nil
+			}
 		}
 	}
 
@@ -604,10 +801,19 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Escape):
 		m.searchBar.Blur()
 		m.searchBar.input.SetValue("") // clear any partial input
+		m.nlSearchMode = false
+		m.searchBar.input.Placeholder = "Search repos (e.g. mcp server, language:go, topic:cli)"
 		m.historyCursor = -1
-		m.focus = paneList
 		if len(m.repos) > 0 {
+			// Return to browsing results
+			m.focus = paneList
 			m.state = stateBrowsing
+		} else {
+			// No results — stay on search prompt, re-focus input
+			m.state = stateSearchPrompt
+			m.focus = paneSearch
+			m.searchBar.Focus()
+			return m, m.searchBar.input.Focus()
 		}
 		return m, nil
 
@@ -621,6 +827,69 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+
+		// "alt <dep>" — find alternatives to a dependency
+		if strings.HasPrefix(query, "alt ") {
+			depName := strings.TrimPrefix(query, "alt ")
+			altQuery := m.buildAltSearch(depName)
+			if altQuery != "" {
+				m.searchParams.Query = altQuery
+				m.loading = true
+				m.list.SetLoading(true)
+				m.statusBar.SetLoading(true)
+				m.searchBar.Blur()
+				m.focus = paneList
+				m.historyCursor = -1
+				m.statusBar.SetMessage("Finding alternatives to "+depName, false)
+				return m, tea.Batch(
+					searchReposCmd(m.github, m.store, m.searchParams),
+					fetchRateLimitCmd(m.github),
+					spinnerTickCmd(),
+				)
+			}
+		}
+
+		// "like" — seed search from local project fingerprint
+		if strings.HasPrefix(query, "like ") || query == "like" {
+			path := strings.TrimPrefix(query, "like ")
+			if path == "" || path == "like" {
+				path = "."
+			}
+			likeQuery := m.buildLikeSearch(path)
+			if likeQuery != "" {
+				m.searchParams.Query = likeQuery
+				m.loading = true
+				m.list.SetLoading(true)
+				m.statusBar.SetLoading(true)
+				m.searchBar.Blur()
+				m.focus = paneList
+				m.historyCursor = -1
+				m.statusBar.SetMessage("Finding repos like "+path, false)
+				return m, tea.Batch(
+					searchReposCmd(m.github, m.store, m.searchParams),
+					fetchRateLimitCmd(m.github),
+					spinnerTickCmd(),
+				)
+			}
+		}
+
+		// NL search mode: route through Claude for translation
+		if m.nlSearchMode && m.claude != nil && m.claude.Available() {
+			m.nlSearchMode = false
+			m.searchBar.input.Placeholder = "Search repos (e.g. mcp server, language:go, topic:cli)"
+			m.statusBar.SetMessage("Translating with Claude...", false)
+			m.loading = true
+			m.list.SetLoading(true)
+			m.statusBar.SetLoading(true)
+			m.searchBar.Blur()
+			m.focus = paneList
+			m.historyCursor = -1
+			return m, tea.Batch(
+				claudeNLSearchCmd(m.claude, query),
+				spinnerTickCmd(),
+			)
+		}
+
 		m.searchParams.Query = query
 		m.loading = true
 		m.searchBar.Blur()
@@ -848,6 +1117,7 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Peek):
 		if sel := al.Selected(); sel != nil {
 			m.peek.Show(sel)
+			return m, peekRevealTickCmd()
 		}
 		return m, nil
 
@@ -870,6 +1140,48 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, clearStatusAfter(2 * time.Second)
 		}
 
+	case key.Matches(msg, keys.AISummarize):
+		if sel := al.Selected(); sel != nil && m.claude != nil && m.claude.Available() {
+			if summary, ok := m.claudeSummaries[sel.FullName]; ok {
+				m.detail.SetAISummary(summary)
+				return m, nil
+			}
+			if m.detail.readme != "" {
+				m.detail.SetSummarizing(true)
+				m.statusBar.SetMessage("Asking Claude...", false)
+				return m, claudeSummarizeCmd(m.claude, sel.FullName, m.detail.readme)
+			}
+			m.statusBar.SetMessage("README not loaded yet", true)
+			return m, clearStatusAfter(2 * time.Second)
+		}
+
+	case key.Matches(msg, keys.WhyTrending):
+		if sel := al.Selected(); sel != nil && m.claude != nil && m.claude.Available() {
+			if analysis, ok := m.claudeAnalyses[sel.FullName]; ok {
+				m.detail.SetAIAnalysis(analysis)
+				return m, nil
+			}
+			m.statusBar.SetMessage("Analyzing trend...", false)
+			return m, claudeWhyTrendingCmd(m.claude, *sel, m.detail.readme)
+		}
+
+	case key.Matches(msg, keys.Compare):
+		if sel := al.Selected(); sel != nil {
+			if !m.compare.HasLeft() {
+				m.compare.MarkLeft(sel)
+				m.statusBar.SetMessage("Compare: "+sel.FullName+" marked — select second repo and press C", false)
+				return m, clearStatusAfter(5 * time.Second)
+			}
+			// Second press: open comparison
+			if sel.FullName != m.compare.left.FullName {
+				m.compare.Show(sel)
+			} else {
+				m.statusBar.SetMessage("Select a different repo to compare", true)
+				return m, clearStatusAfter(2 * time.Second)
+			}
+			return m, nil
+		}
+
 	case key.Matches(msg, keys.Tab):
 		m.focus = paneDetail
 		return m, nil
@@ -889,16 +1201,6 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m *appModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	al := m.activeList()
-
-	// Detail tab switching: 1/2 for Overview/README
-	switch msg.String() {
-	case "1":
-		m.detail.SetTab(tabOverview)
-		return m, nil
-	case "2":
-		m.detail.SetTab(tabReadme)
-		return m, nil
-	}
 
 	switch {
 	// Tab always switches panels (list ↔ detail)
@@ -935,6 +1237,29 @@ func (m *appModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Watch):
 		if sel := al.Selected(); sel != nil {
 			return m, toggleWatchCmd(m.store, sel.FullName)
+		}
+
+	case key.Matches(msg, keys.AISummarize):
+		if sel := al.Selected(); sel != nil && m.claude != nil && m.claude.Available() {
+			if summary, ok := m.claudeSummaries[sel.FullName]; ok {
+				m.detail.SetAISummary(summary)
+				return m, nil
+			}
+			if m.detail.readme != "" {
+				m.detail.SetSummarizing(true)
+				m.statusBar.SetMessage("Asking Claude...", false)
+				return m, claudeSummarizeCmd(m.claude, sel.FullName, m.detail.readme)
+			}
+		}
+
+	case key.Matches(msg, keys.WhyTrending):
+		if sel := al.Selected(); sel != nil && m.claude != nil && m.claude.Available() {
+			if analysis, ok := m.claudeAnalyses[sel.FullName]; ok {
+				m.detail.SetAIAnalysis(analysis)
+				return m, nil
+			}
+			m.statusBar.SetMessage("Analyzing trend...", false)
+			return m, claudeWhyTrendingCmd(m.claude, *sel, m.detail.readme)
 		}
 
 	case key.Matches(msg, keys.Search):
@@ -1007,6 +1332,7 @@ func (m *appModel) recalcLayout() {
 	m.statusBar.SetWidth(m.width)
 	m.helpView.SetSize(m.width, m.height)
 	m.peek.SetSize(m.width, m.height)
+	m.compare.SetSize(m.width, m.height)
 }
 
 func (m *appModel) View() tea.View {
@@ -1018,6 +1344,11 @@ func (m *appModel) View() tea.View {
 		v.Content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
 			styleError.Render(fmt.Sprintf("Terminal too small (need 70x10, have %dx%d)", m.width, m.height)),
 		)
+		return v
+	}
+
+	if m.compare.IsActive() {
+		v.Content = m.compare.View()
 		return v
 	}
 
@@ -1056,11 +1387,7 @@ func (m *appModel) View() tea.View {
 	case paneList:
 		m.statusBar.SetFocusLabel(" LIST ")
 	case paneDetail:
-		tabName := "OVERVIEW"
-		if m.detail.tab == tabReadme {
-			tabName = "README"
-		}
-		m.statusBar.SetFocusLabel(" " + tabName + " ")
+		m.statusBar.SetFocusLabel(" DETAIL ")
 	case paneSearch:
 		m.statusBar.SetFocusLabel(" SEARCH ")
 	}
@@ -1121,6 +1448,15 @@ func (m *appModel) renderFilterBar() string {
 	if f := m.filterInput.Value(); f != "" {
 		return styleSubtle.Render(fmt.Sprintf("  filter: %s  (esc to clear)", f))
 	}
+	// Show topic drift suggestions if available
+	if len(m.suggestedTopics) > 0 {
+		hint := styleMuted.Render("  also try: ")
+		var pills []string
+		for _, t := range m.suggestedTopics {
+			pills = append(pills, styleTopicInline.Render("["+t+"]"))
+		}
+		return hint + strings.Join(pills, " ")
+	}
 	return styleSubtle.Render("  f: filter  a: advanced search")
 }
 
@@ -1154,20 +1490,43 @@ func (m *appModel) renderSearchPrompt() string {
 		styleMuted.Render(" explore the void")
 
 	// ── Search input ──
+	const searchBoxW = 60
+	// Content area = 60 - 2(border) - 2(padding) = 56
+	// textinput.View() = prompt + value + cursor(1), so value = contentW - iconW - promptW - 1
+	iconStr := styleCyan.Render("◎ ")
+	iconW := lipgloss.Width(iconStr)
+	promptW := lipgloss.Width(m.searchBar.input.Prompt)
+	m.searchBar.input.SetWidth(searchBoxW - 2 - 2 - iconW - promptW - 1)
 	inputBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorAccentViolet).
 		Padding(0, 1).
-		Width(60).
-		Render(styleCyan.Render("◎ ") + m.searchBar.input.View())
+		Width(searchBoxW).
+		Render(iconStr + m.searchBar.input.View())
 
 	examples := styleMuted.Render("  mcp server, language:go, topic:cli, stars:>1000   ") +
 		styleAccent.Render("a") + styleMuted.Render(": advanced search")
+	if m.claude != nil && m.claude.Available() {
+		examples += "  " + styleCyan.Render("n") + styleMuted.Render(": AI search")
+	}
+	if m.localScanner != nil {
+		examples += "\n  " + stylePulse.Render("alt <dep>") + styleMuted.Render(": find alternatives") +
+			"  " + stylePulse.Render("like .") + styleMuted.Render(": repos like your project")
+	}
 
 	// ── Preset cards (2×2 grid) ──
 	presets := model.GetPresets()
+	// Personalize presets if taste profile is available
+	if m.tasteEngine != nil && !m.tasteProfile.Empty() {
+		for i := range presets {
+			presets[i] = m.tasteEngine.PersonalizePreset(presets[i], m.tasteProfile)
+		}
+	}
 	icons := []string{"✦", "◈", "⚡", "◎"}
 	cardW := 26
+
+	// Animated border colors for first-launch carousel
+	carouselColors := []color.Color{colorAccentPulse, colorAccentViolet, colorAccentCyan, colorGoldStar}
 
 	renderCard := func(idx int, p model.Preset) string {
 		icon := styleCyan.Render(icons[idx])
@@ -1184,9 +1543,16 @@ func (m *appModel) renderSearchPrompt() string {
 			lipgloss.PlaceHorizontal(cardW-4, lipgloss.Right, key),
 		)
 
+		// Animated border on first launch — each card cycles through accent colors
+		var borderColor color.Color = colorFgGhost
+		if m.firstLaunch {
+			colorIdx := (m.firstLaunchFrame + idx) % len(carouselColors)
+			borderColor = carouselColors[colorIdx]
+		}
+
 		return lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorFgGhost).
+			BorderForeground(borderColor).
 			Padding(0, 1).
 			Width(cardW).
 			Render(inner)
@@ -1240,13 +1606,16 @@ func (m *appModel) renderSearchPrompt() string {
 		logoStr,
 		subtitle,
 		"",
-		"  " + inputBox,
+		lipgloss.NewStyle().MarginLeft(2).Render(inputBox),
 		"  " + examples,
 		"",
-		"  " + row1Cards,
+		lipgloss.NewStyle().MarginLeft(2).Render(row1Cards),
 	}
 	if row2Cards != "" {
-		parts = append(parts, "  "+row2Cards)
+		parts = append(parts, lipgloss.NewStyle().MarginLeft(2).Render(row2Cards))
+	}
+	if m.surprisePick != nil {
+		parts = append(parts, "", m.renderSurprisePickCard())
 	}
 	if historyBlock != "" {
 		parts = append(parts, "", historyBlock)
@@ -1254,6 +1623,80 @@ func (m *appModel) renderSearchPrompt() string {
 
 	body := lipgloss.JoinVertical(lipgloss.Left, parts...)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+}
+
+func (m *appModel) renderSurprisePickCard() string {
+	r := m.surprisePick
+	label := stylePulse.Render("  ⚡ Surprise Pick")
+	name := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render("  " + r.FullName)
+	lang := ""
+	if r.Language != "" {
+		lang = lipgloss.NewStyle().Foreground(langColor(r.Language)).Render("● " + r.Language)
+	}
+	stars := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
+	desc := ""
+	if r.Description != "" {
+		d := r.Description
+		if len(d) > 60 {
+			d = d[:57] + "..."
+		}
+		desc = "\n" + styleMuted.Render("  "+d)
+	}
+	hint := styleMuted.Render("  enter: view  S: new pick")
+	return lipgloss.JoinVertical(lipgloss.Left, label, name+"  "+lang+"  "+stars+desc, hint)
+}
+
+// buildAltSearch generates a search query to find alternatives to a dependency.
+func (m *appModel) buildAltSearch(depName string) string {
+	// Check if we know about this dependency from local scanning
+	if m.store != nil {
+		deps, _ := m.store.GetLocalDependencies()
+		for _, d := range deps {
+			// Match by name or last segment of the module path
+			nameMatch := d.Name == depName || strings.HasSuffix(d.Name, "/"+depName)
+			if nameMatch && d.RepoName != "" {
+				// Use the dependency's language context
+				lang := ""
+				switch d.Source {
+				case "go.mod":
+					lang = "language:go"
+				case "package.json":
+					lang = "language:javascript"
+				case "Cargo.toml":
+					lang = "language:rust"
+				case "requirements.txt", "pyproject.toml":
+					lang = "language:python"
+				}
+				return fmt.Sprintf("%s %s stars:>10", depName, lang)
+			}
+		}
+	}
+	// Fallback: just search for the dep name
+	return depName + " stars:>10"
+}
+
+// buildLikeSearch generates a search query from a local project's fingerprint.
+func (m *appModel) buildLikeSearch(path string) string {
+	if m.localScanner == nil {
+		return ""
+	}
+	fp, err := m.localScanner.ScanDirectory(path)
+	if err != nil || fp == nil {
+		return ""
+	}
+
+	// Save the scan result
+	if m.store != nil {
+		_ = m.store.SaveProjectFingerprint(*fp)
+	}
+
+	parts := []string{}
+	if fp.Language != "" {
+		parts = append(parts, "language:"+strings.ToLower(fp.Language))
+	}
+	parts = append(parts, "stars:>10")
+
+	return strings.Join(parts, " ")
 }
 
 func (m *appModel) renderFormView() string {
@@ -1271,11 +1714,7 @@ func (m *appModel) renderWatchlistView() string {
 	case paneList:
 		m.statusBar.SetFocusLabel(" WATCHLIST ")
 	case paneDetail:
-		tabName := "OVERVIEW"
-		if m.detail.tab == tabReadme {
-			tabName = "README"
-		}
-		m.statusBar.SetFocusLabel(" " + tabName + " ")
+		m.statusBar.SetFocusLabel(" DETAIL ")
 	}
 
 	header := m.renderWatchlistHeader()
@@ -1307,7 +1746,14 @@ func (m *appModel) renderWatchlistHeader() string {
 	if m.watchlistLoading {
 		count = styleSubtle.Render("  refreshing stats…")
 	} else if len(m.watchlistRepos) > 0 {
-		count = styleSubtle.Render(fmt.Sprintf("  %d repos", len(m.watchlistRepos)))
+		// Show "since you last looked" context
+		sinceText := ""
+		if m.store != nil {
+			if lastViewed, err := m.store.GetWatchlistLastViewed(); err == nil && !lastViewed.IsZero() {
+				sinceText = styleMuted.Render("  since " + relativeTime(lastViewed))
+			}
+		}
+		count = styleSubtle.Render(fmt.Sprintf("  %d repos", len(m.watchlistRepos))) + sinceText
 	} else {
 		count = styleSubtle.Render("  empty — press w on a repo to watch it")
 	}
