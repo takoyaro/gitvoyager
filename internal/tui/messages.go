@@ -81,6 +81,32 @@ type watchToggledMsg struct {
 	Watched  bool
 }
 
+// Watchlist screen
+type watchlistReposMsg struct {
+	Repos []model.Repo
+}
+
+type watchlistRefreshedMsg struct {
+	Stats []model.Repo // partial repos with updated star/fork/issue counts
+}
+
+// Star velocity
+type starDeltasLoadedMsg struct {
+	FirstSeenStars map[string]int
+}
+
+// Spinner / rate limit tick
+type spinnerTickMsg struct{}
+type rateLimitTickMsg struct{}
+
+// Return visit
+type returnVisitMsg struct {
+	Repos []model.Repo
+}
+
+// Session quit
+type quitTimerMsg struct{}
+
 // Timer for status auto-clear
 func clearStatusAfter(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg {

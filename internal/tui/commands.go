@@ -3,6 +3,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -108,6 +110,110 @@ func toggleWatchCmd(st *store.Store, fullName string) tea.Cmd {
 		}
 		return watchToggledMsg{FullName: fullName, Watched: watched}
 	}
+}
+
+func loadWatchlistReposCmd(st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return watchlistReposMsg{}
+		}
+		repos, err := st.GetWatchlistRepos()
+		if err != nil {
+			return watchlistReposMsg{}
+		}
+		return watchlistReposMsg{Repos: repos}
+	}
+}
+
+func refreshWatchlistCmd(client *github.Client, fullNames []string) tea.Cmd {
+	return func() tea.Msg {
+		stats, err := client.FetchRepoStats(context.Background(), fullNames)
+		if err != nil {
+			return statusMsg{Text: "Watchlist refresh failed: " + err.Error(), IsError: true}
+		}
+		return watchlistRefreshedMsg{Stats: stats}
+	}
+}
+
+func loadStarDeltasCmd(st *store.Store, repos []model.Repo) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil || len(repos) == 0 {
+			return starDeltasLoadedMsg{}
+		}
+		names := make([]string, len(repos))
+		for i, r := range repos {
+			names[i] = r.FullName
+		}
+		firstSeen, err := st.GetFirstSeenStars(names)
+		if err != nil {
+			return starDeltasLoadedMsg{}
+		}
+		return starDeltasLoadedMsg{FirstSeenStars: firstSeen}
+	}
+}
+
+func yankToClipboard(text string) tea.Cmd {
+	return func() tea.Msg {
+		// Try clipboard commands in order: wl-copy (Wayland), xclip (X11), xsel
+		cmds := []struct {
+			name string
+			args []string
+		}{
+			{"wl-copy", nil},
+			{"xclip", []string{"-selection", "clipboard"}},
+			{"xsel", []string{"--clipboard", "--input"}},
+		}
+		for _, c := range cmds {
+			path, err := exec.LookPath(c.name)
+			if err != nil {
+				continue
+			}
+			cmd := exec.Command(path, c.args...)
+			cmd.Stdin = strings.NewReader(text)
+			if err := cmd.Run(); err == nil {
+				return statusMsg{Text: "yanked: " + text}
+			}
+		}
+		return statusMsg{Text: "no clipboard tool found (install wl-copy or xclip)", IsError: true}
+	}
+}
+
+func checkReturnVisitCmd(st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return returnVisitMsg{}
+		}
+		repos, err := st.GetWatchlistRepos()
+		if err != nil || len(repos) == 0 {
+			return returnVisitMsg{}
+		}
+		// Filter to repos with positive star delta
+		var growing []model.Repo
+		for _, r := range repos {
+			if r.StarDelta > 0 {
+				growing = append(growing, r)
+			}
+		}
+		return returnVisitMsg{Repos: growing}
+	}
+}
+
+func quitTimerCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		return quitTimerMsg{}
+	})
+}
+
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg{}
+	})
+}
+
+func rateLimitTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return rateLimitTickMsg{}
+	})
 }
 
 func loadSearchHistoryCmd(st *store.Store) tea.Cmd {
