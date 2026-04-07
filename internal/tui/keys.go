@@ -26,11 +26,13 @@ type keyMap struct {
 	Peek          key.Binding
 	Yank          key.Binding
 	YankClone     key.Binding
-	Exclude       key.Binding
-	AISummarize   key.Binding
+	Exclude        key.Binding
+	ExcludeManager key.Binding
+	AISummarize    key.Binding
 	NLSearch      key.Binding
 	WhyTrending   key.Binding
 	Compare       key.Binding
+	LangCycle     key.Binding
 }
 
 var keys = keyMap{
@@ -95,7 +97,7 @@ var keys = keyMap{
 		key.WithHelp("tab", "switch pane"),
 	),
 	Escape: key.NewBinding(
-		key.WithKeys("escape"),
+		key.WithKeys("esc"),
 		key.WithHelp("esc", "back"),
 	),
 	PageUp: key.NewBinding(
@@ -128,7 +130,11 @@ var keys = keyMap{
 	),
 	Exclude: key.NewBinding(
 		key.WithKeys("x"),
-		key.WithHelp("x", "exclude"),
+		key.WithHelp("x", "exclude owner/topic"),
+	),
+	ExcludeManager: key.NewBinding(
+		key.WithKeys("X"),
+		key.WithHelp("X", "manage exclusions"),
 	),
 	AISummarize: key.NewBinding(
 		key.WithKeys("A"),
@@ -146,6 +152,10 @@ var keys = keyMap{
 		key.WithKeys("C"),
 		key.WithHelp("C", "compare"),
 	),
+	LangCycle: key.NewBinding(
+		key.WithKeys("left", "right"),
+		key.WithHelp("←/→", "language"),
+	),
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
@@ -155,8 +165,8 @@ func (k keyMap) ShortHelp() []key.Binding {
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Enter, k.Back},
-		{k.Search, k.AdvancedSearch, k.Sort, k.Filter, k.Tab},
-		{k.Open, k.Clone, k.Watch, k.Watchlist, k.Peek, k.Yank, k.Exclude},
+		{k.Search, k.AdvancedSearch, k.Sort, k.Filter, k.LangCycle, k.Tab},
+		{k.Open, k.Clone, k.Watch, k.Watchlist, k.Peek, k.Yank, k.Exclude, k.ExcludeManager},
 		{k.AISummarize, k.NLSearch, k.WhyTrending, k.Compare},
 		{k.PageUp, k.PageDn, k.GoTop, k.GoEnd},
 		{k.Help, k.Quit},

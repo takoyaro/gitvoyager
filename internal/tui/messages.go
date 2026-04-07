@@ -6,6 +6,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/takoyaro/gitvoyager/internal/github"
 	"github.com/takoyaro/gitvoyager/internal/model"
+	"github.com/takoyaro/gitvoyager/internal/store"
 	"github.com/takoyaro/gitvoyager/internal/taste"
 )
 
@@ -106,6 +107,12 @@ type peekRevealTickMsg struct{}
 // First-launch animation tick
 type firstLaunchTickMsg struct{}
 
+// UI micro-animation tick (focus pulse, watch pulse, compare reveal)
+type uiAnimTickMsg struct{}
+
+// Skeleton-to-content crossfade holdoff
+type shimmerHoldMsg struct{}
+
 // Return visit
 type returnVisitMsg struct {
 	Repos []model.Repo
@@ -154,6 +161,18 @@ type starredReposSyncedMsg struct {
 type topicDriftMsg struct {
 	Topics []string
 	Err    error
+}
+
+// Exclusions
+type exclusionsLoadedMsg struct {
+	Set *store.ExclusionSet
+}
+
+type exclusionUpdatedMsg struct {
+	Set   *store.ExclusionSet
+	Kind  string
+	Value string
+	Added bool // true = added, false = removed
 }
 
 // Session quit

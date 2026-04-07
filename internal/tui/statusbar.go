@@ -10,15 +10,17 @@ import (
 )
 
 type statusBarModel struct {
-	width      int
-	message    string
-	isError    bool
-	rateLimit  github.RateLimit
-	repoCount  int
-	filtered   int
-	loading    bool
-	spinFrame  int
-	focusLabel string
+	width          int
+	message        string
+	isError        bool
+	rateLimit      github.RateLimit
+	repoCount      int
+	filtered       int
+	loading        bool
+	spinFrame      int
+	focusLabel     string
+	exclusionCount int
+	singlePane     bool
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -33,6 +35,7 @@ func (m *statusBarModel) ClearMessage()                        { m.message = "";
 func (m *statusBarModel) SetRateLimit(rl github.RateLimit)     { m.rateLimit = rl }
 func (m *statusBarModel) SetLoading(v bool)                    { m.loading = v }
 func (m *statusBarModel) SetFocusLabel(label string)           { m.focusLabel = label }
+func (m *statusBarModel) SetExclusionCount(n int)              { m.exclusionCount = n }
 
 func (m *statusBarModel) SetCounts(total, filtered int) {
 	m.repoCount = total
@@ -63,11 +66,15 @@ func (m *statusBarModel) View() string {
 		zone1 = styleCyan.Render(spinnerFrames[m.spinFrame]+" ") +
 			styleCyan.Render("searching…")
 	} else {
+		hints := "j/k:nav  tab:pane  /:search  s:sort  o:open  c:clone  ?:help"
+		if m.singlePane {
+			hints = "j/k:nav  tab:switch  /:search  o:open  ?:help"
+		}
 		zone1 = lipgloss.NewStyle().Foreground(colorGreenGrow).Render("● ") +
-			styleMuted.Render("j/k:nav  tab:pane  /:search  s:sort  o:open  c:clone  ?:help")
+			styleMuted.Render(hints)
 	}
 
-	// ── Zone 2: repo count ──
+	// ── Zone 2: repo count + exclusion badge ──
 	var zone2 string
 	if m.repoCount > 0 {
 		icon := stylePulse.Render("⚡ ")
@@ -75,6 +82,15 @@ func (m *statusBarModel) View() string {
 			zone2 = icon + stylePrimary.Render(fmt.Sprintf("%d/%d", m.filtered, m.repoCount))
 		} else {
 			zone2 = icon + stylePrimary.Render(fmt.Sprintf("%d", m.repoCount))
+		}
+	}
+	if m.exclusionCount > 0 {
+		badge := lipgloss.NewStyle().Foreground(colorRedAlert).Render(
+			fmt.Sprintf("⊘ %d excluded", m.exclusionCount))
+		if zone2 != "" {
+			zone2 += "  " + badge
+		} else {
+			zone2 = badge
 		}
 	}
 

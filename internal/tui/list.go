@@ -25,6 +25,16 @@ type listModel struct {
 
 	// Shimmer animation for skeleton loading
 	shimmerFrame int
+
+	// Context for empty state rendering
+	isWatchlist bool
+
+	// Shimmer hold: keep skeleton visible briefly after results arrive
+	shimmerHold bool
+
+	// Watch pulse animation
+	watchPulseRepo  string
+	watchPulseFrame int
 }
 
 func newListModel() listModel {
@@ -34,9 +44,10 @@ func newListModel() listModel {
 	}
 }
 
-// visibleCount returns how many items fit on screen (2 lines per item).
+// visibleCount returns how many items fit on screen (3 lines per item: 2 content + 1 gap, except first has no leading gap).
 func (m *listModel) visibleCount() int {
-	v := m.height / 2
+	// N items = 2*N + (N-1) = 3*N - 1 lines, so N <= (height+1)/3
+	v := (m.height + 1) / 3
 	if v < 1 {
 		v = 1
 	}
@@ -161,13 +172,13 @@ func (m *listModel) Len() int {
 }
 
 func (m *listModel) View() string {
-	// Skeleton loading state
-	if m.loading && len(m.filtered) == 0 {
+	// Skeleton loading state (also show during shimmer holdoff for crossfade)
+	if (m.loading && len(m.filtered) == 0) || m.shimmerHold {
 		return m.renderSkeleton()
 	}
 
 	if len(m.filtered) == 0 {
-		return styleSubtle.Width(m.width).Render("  No results")
+		return m.renderListEmpty()
 	}
 
 	vis := m.visibleCount()
@@ -190,6 +201,9 @@ func (m *listModel) View() string {
 		idx := m.filtered[i]
 		repo := m.repos[idx]
 		line1, line2 := m.renderItem(repo, i == m.cursor)
+		if len(lines) > 0 {
+			lines = append(lines, "") // breathing room between items
+		}
 		lines = append(lines, line1, line2)
 	}
 
@@ -264,7 +278,8 @@ func (m *listModel) renderSkeleton() string {
 		b.WriteByte('\n')
 		b.WriteString(lipgloss.NewStyle().Width(m.width).Render(line2))
 		if i < vis-1 {
-			b.WriteByte('\n')
+			b.WriteByte('\n') // end line2
+			b.WriteByte('\n') // gap between skeleton items
 		}
 	}
 	return b.String()
@@ -296,6 +311,33 @@ func (m *listModel) renderShimmerLine(text string, wavePos, rowOffset int) strin
 	return b.String()
 }
 
+func (m *listModel) renderListEmpty() string {
+	icon := styleCyan.Render("◎")
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render(" No results found")
+	hint1 := styleMuted.Render("Try a different query, or")
+	hint2 := styleMuted.Render("press ") + styleAccent.Render("1-5") + styleMuted.Render(" for presets")
+	if m.isWatchlist {
+		icon = styleMuted.Render("♡")
+		title = lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render(" No watched repos")
+		hint1 = styleMuted.Render("Press ") + styleAccent.Render("w") + styleMuted.Render(" on any repo to")
+		hint2 = styleMuted.Render("start tracking it here")
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Center,
+		"", icon+title, "", hint1, hint2, "",
+	)
+	boxW := min(36, m.width-4)
+	if boxW < 20 {
+		boxW = 20
+	}
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorFgGhost).
+		Width(boxW).
+		Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
 func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	w := m.width
 	lang := abbreviateLang(r.Language)
@@ -316,7 +358,7 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	selectBar := " "
 	if selected {
 		if m.focused {
-			selectBar = lipgloss.NewStyle().Foreground(colorAccentViolet).Render("▌")
+			selectBar = lipgloss.NewStyle().Foreground(colorAccentCyan).Render("▌")
 		} else {
 			selectBar = lipgloss.NewStyle().Foreground(colorFgGhost).Render("▌")
 		}
@@ -325,7 +367,16 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	// Status indicator
 	prefix := " "
 	if m.watchSet[r.FullName] {
-		prefix = lipgloss.NewStyle().Foreground(colorRedAlert).Render("♥")
+		if m.watchPulseRepo == r.FullName && m.watchPulseFrame > 0 {
+			// Pulse animation: alternate colors
+			if m.watchPulseFrame%2 == 0 {
+				prefix = lipgloss.NewStyle().Foreground(colorAccentPulse).Bold(true).Render("♥")
+			} else {
+				prefix = lipgloss.NewStyle().Foreground(colorRedAlert).Bold(true).Render("♥")
+			}
+		} else {
+			prefix = lipgloss.NewStyle().Foreground(colorRedAlert).Render("♥")
+		}
 	} else if m.seenSet[r.FullName] {
 		prefix = styleMuted.Render("·")
 	}
@@ -343,7 +394,24 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	}
 	name := r.FullName
 	if len(name) > nameW {
-		name = name[:nameW-1] + "…"
+		if nameW < 10 {
+			// Very tight: show abbreviated owner
+			if len(r.Owner) > nameW-2 {
+				name = r.Owner[:nameW-2] + "/…"
+			} else {
+				name = r.Owner + "/…"
+			}
+		} else if nameW < 15 {
+			// Tight: show owner + truncated repo name
+			remain := nameW - len(r.Owner) - 2 // "/" + "…"
+			if remain > 0 {
+				name = r.Owner + "/" + r.Name[:min(remain, len(r.Name))] + "…"
+			} else {
+				name = name[:nameW-1] + "…"
+			}
+		} else {
+			name = name[:nameW-1] + "…"
+		}
 	}
 	nameStyle := lipgloss.NewStyle().Foreground(colorFgPrimary)
 	if selected {

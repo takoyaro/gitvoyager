@@ -28,7 +28,7 @@ func newSearchBar() searchBarModel {
 
 func (m *searchBarModel) SetWidth(w int) {
 	m.width = w
-	m.input.SetWidth(w - 12)
+	m.input.SetWidth(max(1, w-12))
 }
 
 func (m *searchBarModel) Focus() {

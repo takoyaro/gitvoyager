@@ -21,8 +21,8 @@ var (
 	colorFgGhost     = lipgloss.Color("#2D3748") // structure, skeleton
 
 	// Accents
-	colorAccentViolet = lipgloss.Color("#818CF8") // primary: focus, selected
-	colorAccentCyan   = lipgloss.Color("#22D3EE") // secondary: data, links
+	colorAccentViolet = lipgloss.Color("#818CF8") // secondary: structural, borders, topics
+	colorAccentCyan   = lipgloss.Color("#22D3EE") // primary: focus, interactive, selected
 	colorAccentPulse  = lipgloss.Color("#C084FC") // trending, hot
 
 	// Semantic
@@ -89,7 +89,7 @@ func langColor(lang string) color.Color {
 // ── Backward-compatible aliases ───────────────────────────────────────
 // (used throughout the codebase — point them at the new palette)
 var (
-	colorAccent    = colorAccentViolet
+	colorAccent    = colorAccentCyan
 	colorSubtle    = colorFgSecondary
 	colorStar      = colorGoldStar
 	colorError     = colorRedAlert
@@ -133,7 +133,7 @@ var (
 
 	// Primary accent
 	styleAccent = lipgloss.NewStyle().
-			Foreground(colorAccentViolet)
+			Foreground(colorAccentCyan)
 
 	// Cyan accent — for data, counts
 	styleCyan = lipgloss.NewStyle().
@@ -164,7 +164,7 @@ var (
 	// Header / titles
 	styleHeader = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorAccentViolet).
+			Foreground(colorAccentCyan).
 			PaddingLeft(1)
 
 	// Detail pane title
@@ -191,7 +191,7 @@ var (
 
 	// Search prompt title
 	styleSearchPrompt = lipgloss.NewStyle().
-				Foreground(colorAccentViolet).
+				Foreground(colorAccentCyan).
 				Bold(true)
 
 	// Border style
@@ -200,7 +200,7 @@ var (
 			BorderForeground(colorBorder)
 
 	// Score bar chars
-	styleScoreFilled = lipgloss.NewStyle().Foreground(colorAccentViolet)
+	styleScoreFilled = lipgloss.NewStyle().Foreground(colorAccentCyan)
 	styleScoreEmpty  = lipgloss.NewStyle().Foreground(colorFgGhost)
 
 	// Star meter
@@ -210,7 +210,7 @@ var (
 	// Focus breadcrumb pills (status bar)
 	styleFocusPill = lipgloss.NewStyle().
 			Foreground(colorFgPrimary).
-			Background(colorAccentViolet).
+			Background(colorAccentCyan).
 			Bold(true).
 			PaddingLeft(1).PaddingRight(1)
 
@@ -222,13 +222,13 @@ var (
 	// Panel header titles
 	stylePanelTitle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorAccentViolet)
+			Foreground(colorAccentCyan)
 
 	stylePanelTitleDim = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(colorFgGhost)
 
 	// Scroll indicator
-	styleScrollThumb = lipgloss.NewStyle().Foreground(colorAccentViolet)
+	styleScrollThumb = lipgloss.NewStyle().Foreground(colorAccentCyan)
 	styleScrollTrack = lipgloss.NewStyle().Foreground(colorFgGhost)
 )

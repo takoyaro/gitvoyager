@@ -60,6 +60,7 @@ type appModel struct {
 	detailTag  int
 	width      int
 	height     int
+	singlePane bool // true when terminal too narrow for dual-pane
 	authOk     bool
 	filterMode bool
 	formMode   bool
@@ -78,9 +79,24 @@ type appModel struct {
 	firstLaunch      bool
 	firstLaunchFrame int
 
+	// Micro-animation state
+	focusAnimFrame int // counts down from 3 to 0 on Tab press (3 frames at 80ms = 240ms)
+
+	// Skeleton crossfade
+	shimmerHold bool
+
 	// Local sets
-	watchSet   map[string]bool
-	excludeSet map[string]bool // session-ephemeral exclusions
+	watchSet     map[string]bool
+	excludeSet   map[string]bool      // session-ephemeral per-repo exclusions
+	exclusionSet *store.ExclusionSet  // persistent global exclusions (from SQLite)
+
+	// Exclude picker (inline status bar mode)
+	excludePickerMode  bool
+	excludePickerItems []excludePickerItem
+	excludePickerKW    textinput.Model // keyword input when "keyword..." selected
+
+	// Exclusion manager overlay
+	exclusionMgr exclusionManagerModel
 
 	// Session tracking
 	sessionViewed  int
@@ -91,9 +107,11 @@ type appModel struct {
 	returnVisitRepos []model.Repo
 
 	// Taste profile
-	tasteEngine  *taste.Engine
-	tasteProfile taste.Profile
-	surprisePick *model.Repo
+	tasteEngine      *taste.Engine
+	tasteProfile     taste.Profile
+	surprisePick     *model.Repo
+	langCycleOptions []string // ["", "Python", "Go", ...] — "" = All
+	langCycleIdx     int
 
 	// Local intelligence
 	localScanner *local.Scanner
@@ -129,6 +147,7 @@ func NewApp(cfg *config.Config, st *store.Store, gh *github.Client, te *taste.En
 		searchParams: model.DefaultSearchParams(),
 		watchSet:     make(map[string]bool),
 		excludeSet:      make(map[string]bool),
+		exclusionMgr:    newExclusionManager(),
 		tasteEngine:     te,
 		localScanner:    ls,
 		claude:          cl,
@@ -164,6 +183,7 @@ func (m *appModel) Init() tea.Cmd {
 		m.searchBar.input.Focus(),
 		loadSearchHistoryCmd(m.store),
 		loadWatchlistCmd(m.store),
+		loadExclusionsCmd(m.store),
 		rateLimitTickCmd(),
 		checkReturnVisitCmd(m.store),
 		computeTasteCmd(m.tasteEngine),
@@ -232,8 +252,10 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.repos[i].Watchlisted = m.watchSet[m.repos[i].FullName]
 		}
 		m.loading = false
-		m.list.SetLoading(false)
 		m.statusBar.SetLoading(false)
+		// Hold skeleton visible briefly for crossfade effect
+		m.shimmerHold = true
+		m.list.shimmerHold = true
 		m.list.SetRepos(m.repos)
 		m.list.SetWatched(m.watchSet)
 		m.searchBar.SetQuery(msg.Query)
@@ -245,6 +267,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_ = m.store.SaveSearch(msg.Query, string(m.searchParams.Sort), m.searchParams.Language, len(m.repos))
 		}
 		var cmds []tea.Cmd
+		cmds = append(cmds, shimmerHoldCmd())
 		if sel := m.list.Selected(); sel != nil {
 			m.detailTag++
 			cmds = append(cmds, debounceDetailCmd(m.detailTag, 100*time.Millisecond))
@@ -347,13 +370,10 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.detail.SetReadme(msg.Content)
 
-			// Auto-summarize with Claude if available and not cached
+			// Restore cached summary if available (no auto-call)
 			if m.claude != nil && m.claude.Available() && msg.Content != "" {
 				if summary, ok := m.claudeSummaries[msg.FullName]; ok {
 					m.detail.SetAISummary(summary)
-				} else {
-					m.detail.SetSummarizing(true)
-					return m, claudeSummarizeCmd(m.claude, msg.FullName, msg.Content)
 				}
 			}
 		}
@@ -385,6 +405,34 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.historyCursor = -1
 		return m, nil
+
+	case exclusionsLoadedMsg:
+		m.exclusionSet = msg.Set
+		m.applyGlobalExclusions()
+		m.statusBar.SetExclusionCount(m.exclusionSet.Count())
+		return m, nil
+
+	case exclusionUpdatedMsg:
+		m.exclusionSet = msg.Set
+		m.applyGlobalExclusions()
+		m.statusBar.SetExclusionCount(m.exclusionSet.Count())
+		if m.exclusionMgr.IsActive() {
+			m.exclusionMgr.rebuildItems(m.exclusionSet)
+		}
+		if msg.Added {
+			hidden := m.refilterExclusions()
+			m.list.SetRepos(m.repos)
+			m.list.SetWatched(m.watchSet)
+			label := msg.Kind + " \"" + msg.Value + "\""
+			if hidden > 0 {
+				m.statusBar.SetMessage(fmt.Sprintf("excluded %s (%d repos hidden)", label, hidden), false)
+			} else {
+				m.statusBar.SetMessage("excluded "+label, false)
+			}
+		} else {
+			m.statusBar.SetMessage(fmt.Sprintf("removed %s \"%s\"", msg.Kind, msg.Value), false)
+		}
+		return m, clearStatusAfter(3 * time.Second)
 
 	case watchlistLoadedMsg:
 		m.watchSet = msg.WatchSet
@@ -426,7 +474,10 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			action = "Unwatched"
 		}
 		m.statusBar.SetMessage(action+" "+msg.FullName, false)
-		return m, clearStatusAfter(3 * time.Second)
+		// Watch pulse animation
+		m.list.watchPulseRepo = msg.FullName
+		m.list.watchPulseFrame = 4
+		return m, tea.Batch(clearStatusAfter(3*time.Second), uiAnimTickCmd())
 
 	case watchlistReposMsg:
 		m.watchlistRepos = msg.Repos
@@ -496,6 +547,11 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.list.Tick()
 			return m, spinnerTickCmd()
 		}
+		// Keep ticking for summarize dots animation
+		if m.detail.summarizing {
+			m.detail.summarizeDots = (m.detail.summarizeDots + 1) % 3
+			return m, spinnerTickCmd()
+		}
 		return m, nil
 
 	case rateLimitTickMsg:
@@ -514,8 +570,49 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case uiAnimTickMsg:
+		anyActive := false
+
+		// Compare reveal
+		if m.compare.IsActive() && m.compare.revealPhase < 3 {
+			m.compare.revealPhase++
+			anyActive = true
+		}
+
+		// Focus pulse countdown
+		if m.focusAnimFrame > 0 {
+			m.focusAnimFrame--
+			if m.focusAnimFrame == 0 {
+				m.detail.focusPulseActive = false
+			}
+			anyActive = true
+		}
+
+		// Watch pulse countdown
+		if m.list.watchPulseFrame > 0 {
+			m.list.watchPulseFrame--
+			anyActive = true
+		}
+
+		if anyActive {
+			return m, uiAnimTickCmd()
+		}
+		return m, nil
+
+	case shimmerHoldMsg:
+		m.shimmerHold = false
+		m.list.shimmerHold = false
+		m.list.SetLoading(false)
+		return m, nil
+
 	case tasteProfileMsg:
 		m.tasteProfile = msg.Profile
+		// Build language cycle: All + top languages from taste profile
+		m.langCycleOptions = []string{""}
+		for _, lang := range msg.Profile.TopLanguages {
+			m.langCycleOptions = append(m.langCycleOptions, lang)
+		}
+		m.langCycleIdx = 0
 		if !msg.Profile.Empty() {
 			return m, surprisePickCmd(m.tasteEngine, msg.Profile)
 		}
@@ -555,6 +652,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.nlSearchMode = false
 		m.searchParams = msg.Params
+		m.applyGlobalExclusions()
 		m.searchBar.SetQuery(msg.Display)
 		m.statusBar.SetMessage("AI translated: "+msg.Display, false)
 		m.loading = true
@@ -595,7 +693,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case returnVisitMsg:
 		if len(msg.Repos) > 0 && m.state == stateSearchPrompt && len(m.repos) == 0 {
 			m.returnVisitRepos = msg.Repos
-			m.state = stateReturnVisit
+			// Renders as inline banner in searchPrompt — no state change
 		}
 		return m, nil
 
@@ -617,9 +715,6 @@ func (m *appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	// q: session summary on first press, quit on second (or from quit state)
 	if key.Matches(msg, keys.Quit) && !m.formMode {
-		if m.state == stateReturnVisit {
-			return m, tea.Quit
-		}
 		if m.state == stateWatchlist {
 			m.state = stateBrowsing
 			m.focus = paneList
@@ -663,23 +758,16 @@ func (m *appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Return visit screen: enter=watchlist, /=search, any other key=search prompt
-	if m.state == stateReturnVisit {
-		switch {
-		case key.Matches(msg, keys.Enter):
-			return m.toggleWatchlistState()
-		case key.Matches(msg, keys.Search):
-			m.state = stateSearchPrompt
-			m.focus = paneSearch
-			m.searchBar.Focus()
-			return m, m.searchBar.input.Focus()
-		default:
-			m.state = stateSearchPrompt
-			m.focus = paneSearch
-			m.searchBar.Focus()
-			return m, m.searchBar.input.Focus()
-		}
+	// Exclusion manager overlay captures keys when active
+	if m.exclusionMgr.IsActive() {
+		return m.handleExclusionMgrKey(msg)
 	}
+
+	// Exclude picker captures keys when active
+	if m.excludePickerMode {
+		return m.handleExcludePickerKey(msg)
+	}
+
 
 	// Watchlist toggle from list or detail (not while in search or form)
 	if key.Matches(msg, keys.Watchlist) && m.focus != paneSearch && !m.formMode {
@@ -705,11 +793,13 @@ func (m *appModel) toggleWatchlistState() (tea.Model, tea.Cmd) {
 			_ = m.store.UpdateWatchlistViewedAt()
 		}
 		m.state = stateBrowsing
+		m.list.isWatchlist = false
 		m.focus = paneList
 		return m, nil
 	}
 	m.state = stateWatchlist
 	m.watchlistLoading = true
+	m.list.isWatchlist = true
 	m.focus = paneList
 	return m, loadWatchlistReposCmd(m.store)
 }
@@ -740,12 +830,13 @@ func (m *appModel) launchPreset(idx int) (tea.Model, tea.Cmd) {
 	if idx < 0 || idx >= len(presets) {
 		return m, nil
 	}
-	// Personalize preset with taste profile
 	p := presets[idx]
-	if m.tasteEngine != nil && !m.tasteProfile.Empty() {
-		p = m.tasteEngine.PersonalizePreset(p, m.tasteProfile)
+	// Apply user-selected language filter from cycling
+	if m.langCycleIdx > 0 && m.langCycleIdx < len(m.langCycleOptions) && p.Params.Language == "" {
+		p.Params.Language = m.langCycleOptions[m.langCycleIdx]
 	}
 	m.searchParams = p.Params
+	m.applyGlobalExclusions()
 	m.loading = true
 	m.searchBar.Blur()
 	m.focus = paneList
@@ -765,6 +856,9 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Preset shortcuts and form toggle when input is empty
 	if m.searchBar.Value() == "" {
 		switch msg.String() {
+		case "h":
+			// "h" (back) on empty search bar is a no-op — user is already home
+			return m, nil
 		case "1":
 			return m.launchPreset(0)
 		case "2":
@@ -792,6 +886,16 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					m.searchBar.input.Placeholder = "Search repos (e.g. mcp server, language:go, topic:cli)"
 					m.statusBar.ClearMessage()
 				}
+				return m, nil
+			}
+		case "left":
+			if len(m.langCycleOptions) > 1 {
+				m.langCycleIdx = (m.langCycleIdx - 1 + len(m.langCycleOptions)) % len(m.langCycleOptions)
+				return m, nil
+			}
+		case "right":
+			if len(m.langCycleOptions) > 1 {
+				m.langCycleIdx = (m.langCycleIdx + 1) % len(m.langCycleOptions)
 				return m, nil
 			}
 		}
@@ -824,6 +928,10 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				query = m.searchHistory[m.historyCursor].Query
 			}
 			if query == "" {
+				// Enter with empty input: jump to watchlist if return visit data exists
+				if len(m.returnVisitRepos) > 0 {
+					return m.toggleWatchlistState()
+				}
 				return m, nil
 			}
 		}
@@ -954,6 +1062,7 @@ func (m *appModel) handleFormKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.searchParams = params
+		m.applyGlobalExclusions()
 		m.loading = true
 		m.formMode = false
 		m.searchForm.Blur()
@@ -1064,16 +1173,11 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		al.PageDown()
 
 	case key.Matches(msg, keys.Back), key.Matches(msg, keys.Escape):
-		// Cascade back: list → home (clears results)
 		if m.state == stateWatchlist {
 			return m.toggleWatchlistState()
 		}
-		m.repos = nil
-		m.list.SetRepos(nil)
-		m.excludeSet = make(map[string]bool)
-		m.state = stateSearchPrompt
+		// Non-destructive: keep results visible, just focus search bar
 		m.focus = paneSearch
-		m.searchBar.Reset()
 		m.searchBar.Focus()
 		return m, m.searchBar.input.Focus()
 
@@ -1133,11 +1237,15 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Exclude):
 		if sel := al.Selected(); sel != nil && m.state != stateWatchlist {
-			m.excludeSet[sel.FullName] = true
-			m.applyExclusions()
-			m.statusBar.SetMessage("excluded "+sel.FullName, false)
-			m.statusBar.SetCounts(len(m.repos)-len(m.excludeSet), m.list.Len())
-			return m, clearStatusAfter(2 * time.Second)
+			m.excludePickerItems = buildPickerItems(sel)
+			m.excludePickerMode = true
+			return m, nil
+		}
+
+	case key.Matches(msg, keys.ExcludeManager):
+		if m.exclusionSet != nil {
+			m.exclusionMgr.Show(m.exclusionSet)
+			return m, nil
 		}
 
 	case key.Matches(msg, keys.AISummarize):
@@ -1148,8 +1256,9 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			if m.detail.readme != "" {
 				m.detail.SetSummarizing(true)
+				m.detail.summarizeDots = 0
 				m.statusBar.SetMessage("Asking Claude...", false)
-				return m, claudeSummarizeCmd(m.claude, sel.FullName, m.detail.readme)
+				return m, tea.Batch(claudeSummarizeCmd(m.claude, sel.FullName, m.detail.readme), spinnerTickCmd())
 			}
 			m.statusBar.SetMessage("README not loaded yet", true)
 			return m, clearStatusAfter(2 * time.Second)
@@ -1172,19 +1281,20 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.statusBar.SetMessage("Compare: "+sel.FullName+" marked — select second repo and press C", false)
 				return m, clearStatusAfter(5 * time.Second)
 			}
-			// Second press: open comparison
+			// Second press: open comparison with entrance animation
 			if sel.FullName != m.compare.left.FullName {
 				m.compare.Show(sel)
-			} else {
-				m.statusBar.SetMessage("Select a different repo to compare", true)
-				return m, clearStatusAfter(2 * time.Second)
+				return m, uiAnimTickCmd()
 			}
-			return m, nil
+			m.statusBar.SetMessage("Select a different repo to compare", true)
+			return m, clearStatusAfter(2 * time.Second)
 		}
 
 	case key.Matches(msg, keys.Tab):
 		m.focus = paneDetail
-		return m, nil
+		m.focusAnimFrame = 3
+		m.detail.focusPulseActive = true
+		return m, uiAnimTickCmd()
 	}
 
 	if al.cursor != prevCursor {
@@ -1206,7 +1316,9 @@ func (m *appModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Tab always switches panels (list ↔ detail)
 	case key.Matches(msg, keys.Tab):
 		m.focus = paneList
-		return m, nil
+		m.focusAnimFrame = 3
+		m.detail.focusPulseActive = false
+		return m, uiAnimTickCmd()
 
 	case key.Matches(msg, keys.Back), key.Matches(msg, keys.Escape):
 		m.focus = paneList
@@ -1247,8 +1359,9 @@ func (m *appModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			if m.detail.readme != "" {
 				m.detail.SetSummarizing(true)
+				m.detail.summarizeDots = 0
 				m.statusBar.SetMessage("Asking Claude...", false)
-				return m, claudeSummarizeCmd(m.claude, sel.FullName, m.detail.readme)
+				return m, tea.Batch(claudeSummarizeCmd(m.claude, sel.FullName, m.detail.readme), spinnerTickCmd())
 			}
 		}
 
@@ -1260,6 +1373,19 @@ func (m *appModel) handleDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			m.statusBar.SetMessage("Analyzing trend...", false)
 			return m, claudeWhyTrendingCmd(m.claude, *sel, m.detail.readme)
+		}
+
+	case key.Matches(msg, keys.Exclude):
+		if sel := al.Selected(); sel != nil {
+			m.excludePickerItems = buildPickerItems(sel)
+			m.excludePickerMode = true
+			return m, nil
+		}
+
+	case key.Matches(msg, keys.ExcludeManager):
+		if m.exclusionSet != nil {
+			m.exclusionMgr.Show(m.exclusionSet)
+			return m, nil
 		}
 
 	case key.Matches(msg, keys.Search):
@@ -1301,18 +1427,182 @@ func (m *appModel) cycleSort() tea.Cmd {
 	return nil
 }
 
+// applyGlobalExclusions injects persistent exclusions from SQLite into the current search params.
+// Called after any full replacement of m.searchParams (presets, form, NL search) and after exclusion updates.
+func (m *appModel) applyGlobalExclusions() {
+	if m.exclusionSet == nil {
+		return
+	}
+	m.searchParams.ExcludeTopics = m.exclusionSet.Topics
+	m.searchParams.ExcludeOwners = m.exclusionSet.Owners
+	m.searchParams.ExcludeKeywords = m.exclusionSet.Keywords
+}
+
+// refilterExclusions removes repos from the current result set that match persistent exclusions.
+// Used for immediate feedback after adding an exclusion mid-session.
+func (m *appModel) refilterExclusions() int {
+	if m.exclusionSet == nil || len(m.repos) == 0 {
+		return 0
+	}
+	ownerSet := make(map[string]bool, len(m.exclusionSet.Owners))
+	for _, o := range m.exclusionSet.Owners {
+		ownerSet[strings.ToLower(o)] = true
+	}
+	topicSet := make(map[string]bool, len(m.exclusionSet.Topics))
+	for _, t := range m.exclusionSet.Topics {
+		topicSet[strings.ToLower(t)] = true
+	}
+
+	before := len(m.repos)
+	filtered := m.repos[:0]
+	for _, r := range m.repos {
+		if ownerSet[strings.ToLower(r.Owner)] {
+			continue
+		}
+		// Check topics (only available if enriched)
+		topicHit := false
+		for _, t := range r.Topics {
+			if topicSet[strings.ToLower(t)] {
+				topicHit = true
+				break
+			}
+		}
+		if topicHit {
+			continue
+		}
+		// Check keywords in name/description
+		haystack := strings.ToLower(r.FullName + " " + r.Description)
+		kwHit := false
+		for _, kw := range m.exclusionSet.Keywords {
+			if strings.Contains(haystack, strings.ToLower(kw)) {
+				kwHit = true
+				break
+			}
+		}
+		if kwHit {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	m.repos = filtered
+	return before - len(filtered)
+}
+
+func (m *appModel) handleExclusionMgrKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.exclusionMgr.addMode {
+		switch {
+		case key.Matches(msg, keys.Escape):
+			m.exclusionMgr.addMode = false
+			m.exclusionMgr.addInput.Blur()
+			return m, nil
+		case msg.String() == "tab":
+			m.exclusionMgr.addType = (m.exclusionMgr.addType + 1) % len(addTypeLabels)
+			m.exclusionMgr.addInput.Prompt = "  " + addTypeLabels[m.exclusionMgr.addType] + ": "
+			return m, nil
+		case msg.String() == "enter":
+			val := strings.TrimSpace(m.exclusionMgr.addInput.Value())
+			kind := addTypeLabels[m.exclusionMgr.addType]
+			m.exclusionMgr.addMode = false
+			m.exclusionMgr.addInput.Blur()
+			m.exclusionMgr.addInput.SetValue("")
+			if val == "" {
+				return m, nil
+			}
+			return m, addExclusionCmd(m.store, kind, val)
+		}
+		var cmd tea.Cmd
+		m.exclusionMgr.addInput, cmd = m.exclusionMgr.addInput.Update(msg)
+		return m, cmd
+	}
+
+	switch {
+	case key.Matches(msg, keys.Escape), msg.String() == "X":
+		m.exclusionMgr.Hide()
+		return m, nil
+	case msg.String() == "j", msg.String() == "down":
+		if m.exclusionMgr.cursor < len(m.exclusionMgr.items)-1 {
+			m.exclusionMgr.cursor++
+		}
+		return m, nil
+	case msg.String() == "k", msg.String() == "up":
+		if m.exclusionMgr.cursor > 0 {
+			m.exclusionMgr.cursor--
+		}
+		return m, nil
+	case msg.String() == "d":
+		if item := m.exclusionMgr.selectedItem(); item != nil {
+			kind, value := item.kind, item.value
+			return m, removeExclusionCmd(m.store, kind, value)
+		}
+		return m, nil
+	case msg.String() == "a":
+		m.exclusionMgr.addMode = true
+		m.exclusionMgr.addType = 0
+		m.exclusionMgr.addInput.Prompt = "  " + addTypeLabels[0] + ": "
+		m.exclusionMgr.addInput.SetValue("")
+		return m, m.exclusionMgr.addInput.Focus()
+	}
+
+	return m, nil
+}
+
+func (m *appModel) handleExcludePickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Keyword text input mode
+	if m.excludePickerKW.Focused() {
+		switch {
+		case key.Matches(msg, keys.Escape):
+			m.excludePickerKW.Blur()
+			m.excludePickerMode = false
+			return m, nil
+		case msg.String() == "enter":
+			kw := strings.TrimSpace(m.excludePickerKW.Value())
+			m.excludePickerKW.Blur()
+			m.excludePickerMode = false
+			if kw == "" {
+				return m, nil
+			}
+			return m, addExclusionCmd(m.store, "keyword", kw)
+		}
+		var cmd tea.Cmd
+		m.excludePickerKW, cmd = m.excludePickerKW.Update(msg)
+		return m, cmd
+	}
+
+	switch {
+	case key.Matches(msg, keys.Escape):
+		m.excludePickerMode = false
+		return m, nil
+	}
+
+	// Number keys 1-9 select picker items
+	k := msg.String()
+	if len(k) == 1 && k[0] >= '1' && k[0] <= '9' {
+		idx := int(k[0]-'1')
+		if idx < len(m.excludePickerItems) {
+			item := m.excludePickerItems[idx]
+			m.excludePickerMode = false
+			if item.kind == "keyword" && item.value == "" {
+				// Open keyword text input
+				m.excludePickerKW = textinput.New()
+				m.excludePickerKW.Placeholder = "keyword to exclude…"
+				m.excludePickerKW.Prompt = "  exclude keyword: "
+				m.excludePickerKW.CharLimit = 80
+				m.excludePickerMode = true
+				return m, m.excludePickerKW.Focus()
+			}
+			return m, addExclusionCmd(m.store, item.kind, item.value)
+		}
+	}
+
+	return m, nil
+}
+
 func (m *appModel) recalcLayout() {
-	if m.width < 70 || m.height < 10 {
+	if m.width < 50 || m.height < 8 {
 		return
 	}
 
-	listPct := 35
-	if m.cfg != nil && m.cfg.Display.ListWidthPercent > 0 {
-		listPct = m.cfg.Display.ListWidthPercent
-	}
-
-	listW := m.width * listPct / 100
-	detailW := m.width - listW - 1
+	m.singlePane = m.width < 70
 
 	contentH := m.height - 3
 	if contentH < 1 {
@@ -1324,15 +1614,35 @@ func (m *appModel) recalcLayout() {
 		listContentH = 1
 	}
 
-	m.list.SetSize(listW, listContentH)
-	m.watchlistList.SetSize(listW, listContentH)
-	m.detail.SetSize(detailW, contentH)
+	if m.singlePane {
+		// Single-pane: active pane gets full width
+		fullW := m.width
+		m.list.SetSize(fullW, listContentH)
+		m.watchlistList.SetSize(fullW, listContentH)
+		m.detail.SetSize(fullW, contentH)
+		m.filterInput.SetWidth(max(1, fullW-12))
+	} else {
+		// Dual-pane: proportional split
+		listPct := 35
+		if m.cfg != nil && m.cfg.Display.ListWidthPercent > 0 {
+			listPct = m.cfg.Display.ListWidthPercent
+		}
+		listW := m.width * listPct / 100
+		detailW := m.width - listW - 1
+
+		m.list.SetSize(listW, listContentH)
+		m.watchlistList.SetSize(listW, listContentH)
+		m.detail.SetSize(detailW, contentH)
+		m.filterInput.SetWidth(max(1, listW-12))
+	}
+
 	m.searchBar.SetWidth(m.width)
-	m.filterInput.SetWidth(listW - 12)
 	m.statusBar.SetWidth(m.width)
+	m.statusBar.singlePane = m.singlePane
 	m.helpView.SetSize(m.width, m.height)
 	m.peek.SetSize(m.width, m.height)
 	m.compare.SetSize(m.width, m.height)
+	m.exclusionMgr.SetSize(m.width, m.height)
 }
 
 func (m *appModel) View() tea.View {
@@ -1340,15 +1650,20 @@ func (m *appModel) View() tea.View {
 	v.AltScreen = true
 	v.WindowTitle = "GitVoyager"
 
-	if m.width < 70 || m.height < 10 {
+	if m.width < 50 || m.height < 8 {
 		v.Content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
-			styleError.Render(fmt.Sprintf("Terminal too small (need 70x10, have %dx%d)", m.width, m.height)),
+			styleError.Render(fmt.Sprintf("Terminal too small (need 50x8, have %dx%d)", m.width, m.height)),
 		)
 		return v
 	}
 
 	if m.compare.IsActive() {
 		v.Content = m.compare.View()
+		return v
+	}
+
+	if m.exclusionMgr.IsActive() {
+		v.Content = m.exclusionMgr.View()
 		return v
 	}
 
@@ -1359,11 +1674,6 @@ func (m *appModel) View() tea.View {
 
 	if m.helpView.IsActive() {
 		v.Content = m.helpView.View()
-		return v
-	}
-
-	if m.state == stateReturnVisit {
-		v.Content = m.renderReturnVisit()
 		return v
 	}
 
@@ -1393,25 +1703,50 @@ func (m *appModel) View() tea.View {
 	}
 
 	header := m.searchBar.View()
-	listHeader := m.renderListHeader()
-	filterBar := m.renderFilterBar()
-	listView := lipgloss.JoinVertical(lipgloss.Left, listHeader, filterBar, m.list.View())
 
-	// Focus-aware divider
-	divColor := colorBorder
-	if m.focus == paneList {
-		divColor = colorAccentViolet
-	} else if m.focus == paneDetail {
-		divColor = colorAccentViolet
+	var content string
+	if m.singlePane {
+		// Single-pane mode: show only the focused pane
+		if m.focus == paneDetail {
+			content = m.detail.View()
+		} else {
+			listHeader := m.renderListHeader()
+			filterBar := m.renderFilterBar()
+			content = lipgloss.NewStyle().Width(m.list.width).MaxWidth(m.list.width).
+				Render(lipgloss.JoinVertical(lipgloss.Left, listHeader, filterBar, m.list.View()))
+		}
+	} else {
+		// Dual-pane mode
+		listHeader := m.renderListHeader()
+		filterBar := m.renderFilterBar()
+		listView := lipgloss.NewStyle().Width(m.list.width).MaxWidth(m.list.width).
+			Render(lipgloss.JoinVertical(lipgloss.Left, listHeader, filterBar, m.list.View()))
+
+		divColor := colorBorder
+		if m.focus == paneList || m.focus == paneDetail {
+			if m.focusAnimFrame > 0 {
+				divColor = colorAccentPulse
+			} else {
+				divColor = colorAccentCyan
+			}
+		}
+		border := lipgloss.NewStyle().
+			Foreground(divColor).
+			Render(lipgloss.NewStyle().Height(m.height - 3).Render("│"))
+
+		detailView := m.detail.View()
+		content = lipgloss.JoinHorizontal(lipgloss.Top, listView, border, detailView)
 	}
-	border := lipgloss.NewStyle().
-		Foreground(divColor).
-		Render(lipgloss.NewStyle().Height(m.height - 3).Render("│"))
 
-	detailView := m.detail.View()
-	content := lipgloss.JoinHorizontal(lipgloss.Top, listView, border, detailView)
-
-	status := m.statusBar.View()
+	var status string
+	if m.excludePickerMode && !m.excludePickerKW.Focused() {
+		status = renderPicker(m.excludePickerItems, m.width)
+	} else if m.excludePickerMode && m.excludePickerKW.Focused() {
+		status = lipgloss.NewStyle().PaddingLeft(1).Width(m.width).
+			Render(m.excludePickerKW.View())
+	} else {
+		status = m.statusBar.View()
+	}
 
 	// Window title
 	v.WindowTitle = "GitVoyager"
@@ -1433,7 +1768,7 @@ func (m *appModel) renderListHeader() string {
 	dot := stylePanelTitleDim.Render("○")
 	titleStyle := stylePanelTitleDim
 	if m.focus == paneList {
-		dot = lipgloss.NewStyle().Foreground(colorAccentViolet).Render("●")
+		dot = lipgloss.NewStyle().Foreground(colorAccentCyan).Render("●")
 		titleStyle = stylePanelTitle
 	}
 
@@ -1476,11 +1811,11 @@ func (m *appModel) renderSearchPrompt() string {
 	}
 	var logo strings.Builder
 	for _, line := range logoLines {
-		logo.WriteString(GradientText(line, "#818CF8", "#22D3EE"))
+		logo.WriteString(GradientText(line, "#22D3EE", "#818CF8"))
 		logo.WriteByte('\n')
 	}
 	logoStr := logo.String()
-	voyager := GradientText("  VOYAGER", "#C084FC", "#22D3EE")
+	voyager := GradientText("  VOYAGER", "#22D3EE", "#C084FC")
 	logoStr += voyager
 
 	subtitle := styleMuted.Render("  discover underdogs ") +
@@ -1490,16 +1825,17 @@ func (m *appModel) renderSearchPrompt() string {
 		styleMuted.Render(" explore the void")
 
 	// ── Search input ──
-	const searchBoxW = 60
-	// Content area = 60 - 2(border) - 2(padding) = 56
-	// textinput.View() = prompt + value + cursor(1), so value = contentW - iconW - promptW - 1
+	searchBoxW := min(60, m.width-6)
+	if searchBoxW < 30 {
+		searchBoxW = 30
+	}
 	iconStr := styleCyan.Render("◎ ")
 	iconW := lipgloss.Width(iconStr)
 	promptW := lipgloss.Width(m.searchBar.input.Prompt)
-	m.searchBar.input.SetWidth(searchBoxW - 2 - 2 - iconW - promptW - 1)
+	m.searchBar.input.SetWidth(max(1, searchBoxW-2-2-iconW-promptW-1))
 	inputBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorAccentViolet).
+		BorderForeground(colorAccentCyan).
 		Padding(0, 1).
 		Width(searchBoxW).
 		Render(iconStr + m.searchBar.input.View())
@@ -1514,16 +1850,47 @@ func (m *appModel) renderSearchPrompt() string {
 			"  " + stylePulse.Render("like .") + styleMuted.Render(": repos like your project")
 	}
 
-	// ── Preset cards (2×2 grid) ──
-	presets := model.GetPresets()
-	// Personalize presets if taste profile is available
-	if m.tasteEngine != nil && !m.tasteProfile.Empty() {
-		for i := range presets {
-			presets[i] = m.tasteEngine.PersonalizePreset(presets[i], m.tasteProfile)
+	// ── Language filter indicator ──
+	var langIndicator string
+	if len(m.langCycleOptions) > 1 {
+		var pills []string
+		for i, lang := range m.langCycleOptions {
+			label := lang
+			if label == "" {
+				label = "All"
+			}
+			if i == m.langCycleIdx {
+				c := langColor(lang)
+				if lang == "" {
+					c = colorAccentCyan
+				}
+				pill := lipgloss.NewStyle().
+					Foreground(colorFgPrimary).
+					Background(c).
+					Bold(true).
+					PaddingLeft(1).PaddingRight(1).
+					Render(label)
+				pills = append(pills, pill)
+			} else {
+				pills = append(pills, styleGhost.Render(label))
+			}
 		}
+		langIndicator = "  " + styleGhost.Render("◀ ") + strings.Join(pills, styleMuted.Render(" · ")) + styleGhost.Render(" ▶")
 	}
+
+	// ── Preset cards (responsive grid) ──
+	presets := model.GetPresets()
 	icons := []string{"✦", "◈", "⚡", "◎"}
+	singleColCards := m.width < 65
 	cardW := 26
+	if singleColCards {
+		cardW = min(26, m.width-6)
+	} else {
+		cardW = min(26, (m.width-8)/2)
+	}
+	if cardW < 16 {
+		cardW = 16
+	}
 
 	// Animated border colors for first-launch carousel
 	carouselColors := []color.Color{colorAccentPulse, colorAccentViolet, colorAccentCyan, colorGoldStar}
@@ -1558,14 +1925,22 @@ func (m *appModel) renderSearchPrompt() string {
 			Render(inner)
 	}
 
-	var row1Cards, row2Cards string
-	if len(presets) >= 2 {
-		row1Cards = lipgloss.JoinHorizontal(lipgloss.Top,
-			renderCard(0, presets[0]), "  ", renderCard(1, presets[1]))
-	}
-	if len(presets) >= 4 {
-		row2Cards = lipgloss.JoinHorizontal(lipgloss.Top,
-			renderCard(2, presets[2]), "  ", renderCard(3, presets[3]))
+	var cardRows []string
+	if singleColCards {
+		// Vertical stack
+		for i, p := range presets {
+			cardRows = append(cardRows, renderCard(i, p))
+		}
+	} else {
+		// 2×2 grid
+		if len(presets) >= 2 {
+			cardRows = append(cardRows, lipgloss.JoinHorizontal(lipgloss.Top,
+				renderCard(0, presets[0]), "  ", renderCard(1, presets[1])))
+		}
+		if len(presets) >= 4 {
+			cardRows = append(cardRows, lipgloss.JoinHorizontal(lipgloss.Top,
+				renderCard(2, presets[2]), "  ", renderCard(3, presets[3])))
+		}
 	}
 
 	// ── History ──
@@ -1606,13 +1981,19 @@ func (m *appModel) renderSearchPrompt() string {
 		logoStr,
 		subtitle,
 		"",
-		lipgloss.NewStyle().MarginLeft(2).Render(inputBox),
+		inputBox,
 		"  " + examples,
-		"",
-		lipgloss.NewStyle().MarginLeft(2).Render(row1Cards),
 	}
-	if row2Cards != "" {
-		parts = append(parts, lipgloss.NewStyle().MarginLeft(2).Render(row2Cards))
+	if langIndicator != "" {
+		parts = append(parts, langIndicator)
+	} else {
+		parts = append(parts, "")
+	}
+	if len(m.returnVisitRepos) > 0 {
+		parts = append(parts, "", m.renderReturnVisitBanner())
+	}
+	for _, row := range cardRows {
+		parts = append(parts, row)
 	}
 	if m.surprisePick != nil {
 		parts = append(parts, "", m.renderSurprisePickCard())
@@ -1719,20 +2100,35 @@ func (m *appModel) renderWatchlistView() string {
 
 	header := m.renderWatchlistHeader()
 
-	listHeader := m.renderListHeader()
-	hint := styleSubtle.Render("  w: unwatch  o: open  c: clone  W/q: back")
-	listView := lipgloss.JoinVertical(lipgloss.Left, listHeader, hint, m.watchlistList.View())
+	var content string
+	if m.singlePane {
+		if m.focus == paneDetail {
+			content = m.detail.View()
+		} else {
+			listHeader := m.renderListHeader()
+			hint := styleSubtle.Render("  w: unwatch  o: open  c: clone  W/q: back")
+			content = lipgloss.JoinVertical(lipgloss.Left, listHeader, hint, m.watchlistList.View())
+		}
+	} else {
+		listHeader := m.renderListHeader()
+		hint := styleSubtle.Render("  w: unwatch  o: open  c: clone  W/q: back")
+		listView := lipgloss.JoinVertical(lipgloss.Left, listHeader, hint, m.watchlistList.View())
 
-	divColor := colorBorder
-	if m.focus == paneList || m.focus == paneDetail {
-		divColor = colorAccentViolet
+		divColor := colorBorder
+		if m.focus == paneList || m.focus == paneDetail {
+			if m.focusAnimFrame > 0 {
+				divColor = colorAccentPulse
+			} else {
+				divColor = colorAccentCyan
+			}
+		}
+		border := lipgloss.NewStyle().
+			Foreground(divColor).
+			Render(lipgloss.NewStyle().Height(m.height - 3).Render("│"))
+
+		detailView := m.detail.View()
+		content = lipgloss.JoinHorizontal(lipgloss.Top, listView, border, detailView)
 	}
-	border := lipgloss.NewStyle().
-		Foreground(divColor).
-		Render(lipgloss.NewStyle().Height(m.height - 3).Render("│"))
-
-	detailView := m.detail.View()
-	content := lipgloss.JoinHorizontal(lipgloss.Top, listView, border, detailView)
 
 	status := m.statusBar.View()
 
@@ -1755,38 +2151,61 @@ func (m *appModel) renderWatchlistHeader() string {
 		}
 		count = styleSubtle.Render(fmt.Sprintf("  %d repos", len(m.watchlistRepos))) + sinceText
 	} else {
-		count = styleSubtle.Render("  empty — press w on a repo to watch it")
+		count = styleMuted.Render("  ♡ empty — press ") + styleAccent.Render("w") + styleMuted.Render(" on a repo to watch it")
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Center, title, count)
 }
 
 func (m *appModel) renderReturnVisit() string {
+	return "" // deprecated: return visit now renders inline via renderReturnVisitBanner
+}
+
+func (m *appModel) renderReturnVisitBanner() string {
+	// Determine width to match search box
+	bannerW := min(60, m.width-6)
+	if bannerW < 30 {
+		bannerW = 30
+	}
+	innerW := bannerW - 4 // border padding
+
 	var lines []string
 
-	lines = append(lines, "")
-	lines = append(lines, GradientText("  GitVoyager", "#818CF8", "#22D3EE"))
-	lines = append(lines, "")
-	lines = append(lines, styleSubtle.Render("  since you were here"))
+	// Header
+	title := styleMuted.Render("since you were here")
+	lines = append(lines, title)
 	lines = append(lines, "")
 
-	for _, r := range m.returnVisitRepos {
-		delta := styleSuccess.Render(fmt.Sprintf("  ▲+%-5d", r.StarDelta))
+	// Delta repos (cap at 5)
+	shown := m.returnVisitRepos
+	if len(shown) > 5 {
+		shown = shown[:5]
+	}
+	for _, r := range shown {
+		delta := styleSuccess.Render(fmt.Sprintf("▲+%-4d", r.StarDelta))
 		name := stylePrimary.Render(r.FullName)
-		stars := styleMuted.Render(fmt.Sprintf(" (%s ★)", formatStars(r.Stars)))
-		lines = append(lines, delta+name+stars)
+		stars := styleMuted.Render(fmt.Sprintf("(%s ★)", formatStars(r.Stars)))
+
+		nameW := lipgloss.Width(delta) + lipgloss.Width(name)
+		starsW := lipgloss.Width(stars)
+		gap := innerW - nameW - starsW
+		if gap < 1 {
+			gap = 1
+		}
+		lines = append(lines, delta+name+strings.Repeat(" ", gap)+stars)
 	}
 
-	if len(m.returnVisitRepos) == 0 {
-		lines = append(lines, styleMuted.Render("  your watched repos are holding steady"))
-	}
-
+	// Hint
 	lines = append(lines, "")
-	lines = append(lines, styleAccent.Render("  enter")+styleMuted.Render(" view watchlist   ")+
-		styleAccent.Render("/")+styleMuted.Render(" search   ")+
-		styleAccent.Render("q")+styleMuted.Render(" quit"))
+	hint := styleAccent.Render("enter") + styleMuted.Render(" watchlist  ·  start typing to search")
+	lines = append(lines, hint)
 
-	body := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorAccentViolet).
+		Padding(0, 1).
+		Width(bannerW).
+		Render(content)
 }
 
 func (m *appModel) renderHistoryItem(idx int, s searchHistoryItem) string {

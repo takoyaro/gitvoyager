@@ -353,6 +353,38 @@ func claudeWhyTrendingCmd(client *claude.Client, repo model.Repo, readme string)
 	}
 }
 
+func loadExclusionsCmd(st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return exclusionsLoadedMsg{}
+		}
+		set, _ := st.GetAllExclusions()
+		return exclusionsLoadedMsg{Set: set}
+	}
+}
+
+func addExclusionCmd(st *store.Store, kind, value string) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return exclusionUpdatedMsg{}
+		}
+		_ = st.AddExclusion(kind, value)
+		set, _ := st.GetAllExclusions()
+		return exclusionUpdatedMsg{Set: set, Kind: kind, Value: value, Added: true}
+	}
+}
+
+func removeExclusionCmd(st *store.Store, kind, value string) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return exclusionUpdatedMsg{}
+		}
+		_ = st.RemoveExclusion(kind, value)
+		set, _ := st.GetAllExclusions()
+		return exclusionUpdatedMsg{Set: set, Kind: kind, Value: value, Added: false}
+	}
+}
+
 func firstLaunchTickCmd() tea.Cmd {
 	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg {
 		return firstLaunchTickMsg{}
@@ -360,8 +392,20 @@ func firstLaunchTickCmd() tea.Cmd {
 }
 
 func peekRevealTickCmd() tea.Cmd {
-	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
 		return peekRevealTickMsg{}
+	})
+}
+
+func uiAnimTickCmd() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
+		return uiAnimTickMsg{}
+	})
+}
+
+func shimmerHoldCmd() tea.Cmd {
+	return tea.Tick(400*time.Millisecond, func(t time.Time) tea.Msg {
+		return shimmerHoldMsg{}
 	})
 }
 

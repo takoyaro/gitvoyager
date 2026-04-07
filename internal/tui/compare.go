@@ -9,11 +9,12 @@ import (
 )
 
 type compareModel struct {
-	left   *model.Repo
-	right  *model.Repo
-	active bool
-	width  int
-	height int
+	left        *model.Repo
+	right       *model.Repo
+	active      bool
+	width       int
+	height      int
+	revealPhase int // 0-3: entrance animation phases
 }
 
 func (m *compareModel) SetSize(w, h int) {
@@ -28,6 +29,7 @@ func (m *compareModel) MarkLeft(r *model.Repo) {
 func (m *compareModel) Show(r *model.Repo) {
 	m.right = r
 	m.active = true
+	m.revealPhase = 0
 }
 
 func (m *compareModel) Hide() {
@@ -50,29 +52,54 @@ func (m *compareModel) View() string {
 	}
 
 	innerW := m.width - 6
-	if innerW < 60 {
-		innerW = 60
+	if innerW < 40 {
+		innerW = 40
 	}
 	if innerW > m.width-4 {
 		innerW = m.width - 4
 	}
-	colW := (innerW - 5) / 2 // 5 = divider + padding
 
-	leftCol := m.renderRepoColumn(m.left, colW)
-	rightCol := m.renderRepoColumn(m.right, colW)
-
-	divider := lipgloss.NewStyle().
-		Foreground(colorFgGhost).
-		Render(strings.Repeat("│\n", strings.Count(leftCol, "\n")+1))
-
-	content := lipgloss.JoinHorizontal(lipgloss.Top,
-		lipgloss.NewStyle().Width(colW).Render(leftCol),
-		"  "+divider+"  ",
-		lipgloss.NewStyle().Width(colW).Render(rightCol),
-	)
+	stacked := m.width < 90
 
 	title := stylePulse.Render("  ◎ Side-by-Side Comparison")
+	if stacked {
+		title = stylePulse.Render("  ◎ Comparison")
+	}
 	hint := styleMuted.Render("  esc/q: close  C: clear")
+
+	var content string
+	if m.revealPhase < 1 {
+		// Phase 0: title + loading placeholder
+		content = styleMuted.Render("  Loading comparison...")
+	} else if m.revealPhase < 2 {
+		// Phase 1: left column only
+		colW := innerW - 4
+		if !stacked {
+			colW = (innerW - 5) / 2
+		}
+		content = m.renderRepoColumn(m.left, colW)
+	} else {
+		// Phase 2+: full layout
+		if stacked {
+			colW := innerW - 4
+			leftCol := m.renderRepoColumn(m.left, colW)
+			rightCol := m.renderRepoColumn(m.right, colW)
+			sep := styleMuted.Render(strings.Repeat("─", colW))
+			content = lipgloss.JoinVertical(lipgloss.Left, leftCol, "", sep, "", rightCol)
+		} else {
+			colW := (innerW - 5) / 2
+			leftCol := m.renderRepoColumn(m.left, colW)
+			rightCol := m.renderRepoColumn(m.right, colW)
+			divider := lipgloss.NewStyle().
+				Foreground(colorFgGhost).
+				Render(strings.Repeat("│\n", strings.Count(leftCol, "\n")+1))
+			content = lipgloss.JoinHorizontal(lipgloss.Top,
+				lipgloss.NewStyle().Width(colW).Render(leftCol),
+				"  "+divider+"  ",
+				lipgloss.NewStyle().Width(colW).Render(rightCol),
+			)
+		}
+	}
 
 	inner := lipgloss.JoinVertical(lipgloss.Left, title, "", content, "", hint)
 

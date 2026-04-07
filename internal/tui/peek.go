@@ -117,11 +117,19 @@ func (m *peekModel) View() string {
 	if phase >= 4 {
 		if len(r.Topics) > 0 {
 			lines = append(lines, "")
-			var tags []string
+			topicLine := ""
 			for _, t := range r.Topics {
-				tags = append(tags, styleTopicInline.Render("["+t+"]"))
+				tag := styleTopicInline.Render("[" + t + "]")
+				if topicLine != "" && lipgloss.Width(topicLine)+lipgloss.Width(tag)+1 > innerW-4 {
+					topicLine += styleMuted.Render(" …")
+					break
+				}
+				if topicLine != "" {
+					topicLine += " "
+				}
+				topicLine += tag
 			}
-			lines = append(lines, strings.Join(tags, " "))
+			lines = append(lines, topicLine)
 		}
 		lines = append(lines, "")
 		lines = append(lines, styleMuted.Render("space/q/esc: close  enter: full detail  w: watch  o: open"))

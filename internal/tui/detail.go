@@ -24,9 +24,18 @@ type detailModel struct {
 	aiSummary    string
 	aiAnalysis   string
 	summarizing  bool
+
+	// Animation state
+	summarizeDots    int  // 0-2: cycles ".", "..", "..."
+	focusPulseActive bool // true during focus transition pulse
 }
 
 func (m *detailModel) SetFocused(v bool) { m.focused = v }
+
+// contentWidth returns the max width for text content, capped for readability.
+func (m *detailModel) contentWidth() int {
+	return min(m.width, 120)
+}
 
 func newDetailModel() detailModel {
 	vp := viewport.New()
@@ -37,14 +46,17 @@ func (m *detailModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
 	m.viewport.SetWidth(w)
-	m.viewport.SetHeight(h - m.headerHeight())
+	m.viewport.SetHeight(max(1, h-m.headerHeight()))
 	if m.repo != nil {
 		m.updateContent()
 	}
 }
 
 func (m *detailModel) headerHeight() int {
-	return 7 // border(2) + stats(1) + name(1) + meter+license(1) + topics(1) + gap(1)
+	if m.height < 20 {
+		return 4 // compact: border(2) + name+stats(1) + gap(1)
+	}
+	return 5 // full: border(2) + name+lang+stats(1) + meter+license(1) + gap(1), topics optional
 }
 
 func (m *detailModel) SetRepo(r *model.Repo) {
@@ -92,7 +104,15 @@ func (m *detailModel) SetLoading(v bool) {
 
 func (m *detailModel) updateContent() {
 	if m.repo == nil {
-		m.viewport.SetContent(styleSubtle.Render("  Select a repo to view details"))
+		empty := lipgloss.JoinVertical(lipgloss.Center,
+			"",
+			styleCyan.Render("◈")+lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render("  Select a repo"),
+			"",
+			styleMuted.Render("j/k to navigate the list"),
+			styleMuted.Render("enter or l to view details"),
+			styleMuted.Render("space to quick peek"),
+		)
+		m.viewport.SetContent(lipgloss.Place(m.width, max(1, m.height-m.headerHeight()), lipgloss.Center, lipgloss.Center, empty))
 		return
 	}
 	m.viewport.SetContent(m.renderCombinedView())
@@ -108,7 +128,7 @@ func (m *detailModel) renderCombinedView() string {
 	// Description
 	if r.Description != "" {
 		desc := r.Description
-		maxW := m.width - 4
+		maxW := m.contentWidth() - 4
 		if len(desc) > maxW {
 			desc = desc[:maxW-3] + "..."
 		}
@@ -163,7 +183,8 @@ func (m *detailModel) renderCombinedView() string {
 		aiText := stylePrimary.Render("  " + m.aiSummary)
 		sections = append(sections, "", aiLabel, aiText)
 	} else if m.summarizing {
-		sections = append(sections, "", styleCyan.Render("  ◎ Summarizing..."))
+		dots := strings.Repeat(".", m.summarizeDots+1)
+		sections = append(sections, "", styleCyan.Render("  ◎ Summarizing"+dots))
 	}
 
 	// -- AI Analysis (Why Trending) --
@@ -174,7 +195,7 @@ func (m *detailModel) renderCombinedView() string {
 	}
 
 	// -- Separator --
-	sepW := m.width - 6
+	sepW := m.contentWidth() - 6
 	if sepW < 4 {
 		sepW = 4
 	}
@@ -188,18 +209,21 @@ func (m *detailModel) renderCombinedView() string {
 
 func (m *detailModel) renderReadmeContent() string {
 	if m.loading {
-		return styleSubtle.Render("  Loading README...")
+		return styleCyan.Render("  ◎ ") + stylePrimary.Render("Loading README...")
 	}
 	if m.readme != "" {
 		return m.renderMarkdown(m.readme)
 	}
-	return styleSubtle.Render("  No README available")
+	return styleMuted.Render("  ──") + "\n\n" +
+		styleCyan.Render("  ◇") + stylePrimary.Render(" No README available") + "\n\n" +
+		styleMuted.Render("  This repo has no README file.\n") +
+		styleMuted.Render("  Press ") + styleAccent.Render("o") + styleMuted.Render(" to view on GitHub.")
 }
 
 func (m *detailModel) renderMarkdown(md string) string {
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStylePath("dark"),
-		glamour.WithWordWrap(m.width-4),
+		glamour.WithWordWrap(m.contentWidth()-4),
 	)
 	if err != nil {
 		return md
@@ -219,74 +243,108 @@ func (m *detailModel) View() string {
 
 func (m *detailModel) renderHeader() string {
 	if m.repo == nil {
+		if m.height < 20 {
+			return strings.Repeat("\n", 2)
+		}
 		return strings.Repeat("\n", 5)
 	}
 
 	r := m.repo
 	innerW := m.width - 4 // border padding
 
-	// Row 1: language + stats
+	borderColor := colorFgGhost
+	if m.focused {
+		if m.focusPulseActive {
+			borderColor = colorAccentPulse // brighter flash during pulse
+		} else {
+			borderColor = colorAccentCyan
+		}
+	}
+
+	if m.height < 20 {
+		// Compact header: single row with name + stats
+		owner := lipgloss.NewStyle().Italic(true).Foreground(colorFgMuted).Render(r.Owner + "/")
+		name := GradientText(r.Name, "#22D3EE", "#818CF8")
+		namePart := owner + name
+
+		statParts := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
+		if r.Language != "" {
+			statParts = styleLang.Foreground(langColor(r.Language)).Render("● "+r.Language) + "  " + statParts
+		}
+
+		gap := innerW - lipgloss.Width(namePart) - lipgloss.Width(statParts)
+		if gap < 1 {
+			gap = 1
+		}
+		row := namePart + strings.Repeat(" ", gap) + statParts
+
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(0, 1).
+			Width(m.width - 2).
+			Render(row)
+		return box
+	}
+
+	// Full header: 3 content rows (merged lang+name+stats, meter+license, topics)
+	// Row 1: [● lang] owner/name ........... ★ stars  ⑂ forks
 	langPart := ""
 	if r.Language != "" {
-		langPart = styleLang.Foreground(langColor(r.Language)).Render("● " + r.Language)
+		langPart = styleLang.Foreground(langColor(r.Language)).Render("● "+r.Language) + " "
 	}
+	owner := lipgloss.NewStyle().Italic(true).Foreground(colorFgMuted).Render(r.Owner + "/")
+	name := GradientText(r.Name, "#22D3EE", "#818CF8")
+	namePart := langPart + owner + name
+
 	statParts := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
 	statParts += styleMuted.Render(fmt.Sprintf("  ⑂ %s", formatStars(r.Forks)))
-	row1Gap := innerW - lipgloss.Width(langPart) - lipgloss.Width(statParts)
+	row1Gap := innerW - lipgloss.Width(namePart) - lipgloss.Width(statParts)
 	if row1Gap < 1 {
 		row1Gap = 1
 	}
-	row1 := langPart + strings.Repeat(" ", row1Gap) + statParts
+	row1 := namePart + strings.Repeat(" ", row1Gap) + statParts
 
-	// Row 2: owner/name
-	owner := lipgloss.NewStyle().Italic(true).Foreground(colorFgMuted).Render(r.Owner + "/")
-	name := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render(r.Name)
-	row2 := owner + name
-
-	// Row 3: star meter + score + license
+	// Row 2: star meter + score + license
 	meter := renderStarMeter(r.StarPercentile)
 	scorePart := styleCyan.Render(fmt.Sprintf("◈ score %.0f", r.DiscoveryScore))
 	licPart := ""
 	if r.License != "" {
 		licPart = styleMuted.Render("◎ " + r.License)
 	}
-	row3Parts := []string{meter, scorePart}
+	row2Parts := []string{meter, scorePart}
 	if licPart != "" {
-		row3Parts = append(row3Parts, licPart)
+		row2Parts = append(row2Parts, licPart)
 	}
-	row3 := strings.Join(row3Parts, "   ")
+	row2 := strings.Join(row2Parts, "   ")
 
-	// Row 4: topics
-	row4 := ""
+	// Row 3: topics (only if present)
+	rows := []string{row1, row2}
 	if len(r.Topics) > 0 {
 		var tags []string
 		for _, t := range r.Topics {
 			tags = append(tags, styleTopicInline.Render("["+t+"]"))
 		}
-		row4 = strings.Join(tags, " ")
-		if lipgloss.Width(row4) > innerW {
-			// Truncate topics to fit
-			row4 = ""
+		topicRow := strings.Join(tags, " ")
+		if lipgloss.Width(topicRow) > innerW {
+			topicRow = ""
 			for _, t := range r.Topics {
 				tag := styleTopicInline.Render("[" + t + "]")
-				if lipgloss.Width(row4)+lipgloss.Width(tag)+1 > innerW {
-					row4 += styleMuted.Render(" …")
+				if lipgloss.Width(topicRow)+lipgloss.Width(tag)+1 > innerW {
+					topicRow += styleMuted.Render(" …")
 					break
 				}
-				if row4 != "" {
-					row4 += " "
+				if topicRow != "" {
+					topicRow += " "
 				}
-				row4 += tag
+				topicRow += tag
 			}
 		}
+		rows = append(rows, topicRow)
 	}
 
-	inner := lipgloss.JoinVertical(lipgloss.Left, row1, row2, row3, row4)
+	inner := lipgloss.JoinVertical(lipgloss.Left, rows...)
 
-	borderColor := colorFgGhost
-	if m.focused {
-		borderColor = colorAccentViolet
-	}
 	box := lipgloss.NewStyle().
 		Border(lipgloss.DoubleBorder()).
 		BorderForeground(borderColor).
