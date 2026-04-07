@@ -46,8 +46,62 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(migration002); err != nil {
 		return err
 	}
-	return s.migration003()
+	if err := s.migration003(); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(migration004); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(migration005); err != nil {
+		return err
+	}
+	if err := s.migration006(); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(migration007)
+	return err
 }
+
+const migration007 = `
+CREATE TABLE IF NOT EXISTS star_snapshots (
+	full_name   TEXT NOT NULL,
+	stars       INTEGER NOT NULL,
+	recorded_at TEXT DEFAULT (datetime('now')),
+	PRIMARY KEY (full_name, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_star_snapshots_time ON star_snapshots(recorded_at DESC);
+`
+
+const migration005 = `
+CREATE TABLE IF NOT EXISTS local_projects (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	path        TEXT NOT NULL UNIQUE,
+	name        TEXT DEFAULT '',
+	language    TEXT DEFAULT '',
+	scanned_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS local_dependencies (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	project_id   INTEGER NOT NULL REFERENCES local_projects(id),
+	name         TEXT NOT NULL,
+	version      TEXT DEFAULT '',
+	source       TEXT DEFAULT '',
+	github_repo  TEXT DEFAULT '',
+	UNIQUE(project_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_deps_repo ON local_dependencies(github_repo) WHERE github_repo != '';
+`
+
+const migration004 = `
+CREATE TABLE IF NOT EXISTS taste_snapshots (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	profile_json TEXT NOT NULL,
+	computed_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_taste_snapshots_time ON taste_snapshots(computed_at DESC);
+`
 
 // migration003 adds first_seen_stars for tracking star velocity.
 // Uses addColumnIfNotExists so it's safe to run multiple times.
@@ -58,6 +112,10 @@ func (s *Store) migration003() error {
 	// Seed existing rows: treat their current star count as the baseline.
 	_, err := s.db.Exec(`UPDATE repos SET first_seen_stars = stars WHERE first_seen_stars = 0 AND stars > 0`)
 	return err
+}
+
+func (s *Store) migration006() error {
+	return s.addColumnIfNotExists("watchlist", "last_viewed_at", "TEXT DEFAULT ''")
 }
 
 func (s *Store) addColumnIfNotExists(table, column, def string) error {

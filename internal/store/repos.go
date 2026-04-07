@@ -194,3 +194,27 @@ func (s *Store) GetWatchlistRepos() ([]model.Repo, error) {
 	}
 	return repos, rows.Err()
 }
+
+// GetWatchlistLastViewed returns when the user last viewed the watchlist.
+func (s *Store) GetWatchlistLastViewed() (time.Time, error) {
+	var ts string
+	err := s.db.QueryRow(`
+		SELECT last_viewed_at FROM watchlist
+		WHERE last_viewed_at != ''
+		ORDER BY last_viewed_at DESC
+		LIMIT 1
+	`).Scan(&ts)
+	if err != nil || ts == "" {
+		return time.Time{}, err
+	}
+	t, _ := time.Parse(time.RFC3339, ts)
+	return t, nil
+}
+
+// UpdateWatchlistViewedAt stamps the current time on all watchlist entries.
+func (s *Store) UpdateWatchlistViewedAt() error {
+	_, err := s.db.Exec(`
+		UPDATE watchlist SET last_viewed_at = datetime('now')
+	`)
+	return err
+}
