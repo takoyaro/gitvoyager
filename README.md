@@ -53,6 +53,8 @@ on the [Releases](https://github.com/takoyaro/gitvoyager/releases) page.
 gitvoyager                    # interactive search prompt
 gitvoyager -q "mcp server"   # jump straight into results
 gitvoyager rust web framework # positional args work too
+gitvoyager data stats         # aggregate discovery stats (JSON)
+gitvoyager data repos --table # browse stored repos in a table
 ```
 
 On first launch you'll land on the search prompt. Type a query or press
@@ -73,6 +75,7 @@ pick based on your taste profile.
 | <kbd>/</kbd> | Search | | <kbd>f</kbd> | Filter results |
 | <kbd>a</kbd> | Advanced search | | <kbd>x</kbd> | Exclude repo |
 | <kbd>y</kbd> / <kbd>Y</kbd> | Yank URL / clone cmd | | <kbd>C</kbd> | Compare repos |
+| <kbd>X</kbd> | Exclusion manager | | <kbd>&larr;</kbd> / <kbd>&rarr;</kbd> | Cycle language filter |
 | <kbd>?</kbd> | Help | | <kbd>q</kbd> | Quit |
 
 ### AI (requires Claude)
@@ -109,6 +112,11 @@ protocol          = "ssh"    # or "https"
 [claude]
 enabled = true
 model   = "haiku"            # haiku | sonnet | opus
+
+[exclusions]
+keywords = ["awesome-list"]  # hide repos matching name/description
+topics   = ["hacktoberfest"] # -topic: qualifiers in GitHub search
+owners   = []                # -user: qualifiers in GitHub search
 
 [local]
 enabled    = false

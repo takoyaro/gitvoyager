@@ -16,6 +16,8 @@ task clean          # Remove build artifacts
 
 Binary entry point: `cmd/gitvoyager/main.go`. Flags: `-q`/`-query` (initial search), `-v`/`-version`.
 
+Data CLI: `gitvoyager data <command>` exposes the discovery database. Commands: `repos`, `watchlist`, `searches`, `rising`, `taste`, `velocity`, `stats`, `seen`, `local`. Each supports `--table` for human-readable output (default: JSON).
+
 ## Architecture
 
 Bubble Tea (Elm-architecture) TUI that discovers GitHub repos via the `gh` CLI (not direct API).
@@ -24,11 +26,11 @@ Bubble Tea (Elm-architecture) TUI that discovers GitHub repos via the `gh` CLI (
 
 ### Packages
 
-- **`internal/tui/`** (~3k LOC) &mdash; Bubble Tea app with state machine (`stateSearchPrompt` &rarr; `stateBrowsing` &rarr; `stateWatchlist` &rarr; `stateReturnVisit`). Three focus panes (list, detail, search) plus peek overlay. `app.go` is the central Update/View hub; `list.go`, `detail.go`, `statusbar.go` are sub-models composed inside it.
+- **`internal/tui/`** (~3k LOC) &mdash; Bubble Tea app with state machine (`stateSearchPrompt` &rarr; `stateBrowsing` &rarr; `stateWatchlist` &rarr; `stateReturnVisit`). Three focus panes (list, detail, search) plus peek overlay and exclusion manager. `app.go` is the central Update/View hub; `list.go`, `detail.go`, `statusbar.go` are sub-models composed inside it. Responsive single-pane layout activates on narrow terminals.
 - **`internal/github/`** &mdash; Wraps `gh` CLI commands (`gh search repos`, `gh api graphql`, `gh repo clone`). All GitHub communication goes through shell-exec of `gh`. Requires an authenticated `gh` session.
-- **`internal/store/`** &mdash; SQLite (pure-Go `modernc.org/sqlite`, no CGO) with WAL mode. Tables: `repos`, `seen_log`, `watchlist`, `api_cache`, `search_history`. Migrations are idempotent (safe to re-run).
+- **`internal/store/`** &mdash; SQLite (pure-Go `modernc.org/sqlite`, no CGO) with WAL mode. Tables: `repos`, `seen_log`, `watchlist`, `api_cache`, `search_history`, `exclusions`. `exclusions.go` manages keyword/topic/owner block rules; `query.go` provides aggregate stats and paginated repo queries. Migrations are idempotent (safe to re-run).
 - **`internal/model/`** &mdash; `Repo` struct, `SearchParams`, `Preset` definitions, scoring functions (`ComputeScores`, `SortByScore`).
-- **`internal/config/`** &mdash; TOML config at `$XDG_CONFIG_HOME/gitvoyager/config.toml`. Falls back to defaults if missing.
+- **`internal/config/`** &mdash; TOML config at `$XDG_CONFIG_HOME/gitvoyager/config.toml`. Falls back to defaults if missing. Includes `[exclusions]` section for seeding keyword/topic/owner block lists.
 
 ### Data flow
 
@@ -41,7 +43,7 @@ Bubble Tea (Elm-architecture) TUI that discovers GitHub repos via the `gh` CLI (
 
 ### TUI styling
 
-Kanagawa/Tokyo Night dual-accent palette (violet + cyan) defined in `tui/styles.go`. `tui/gradient.go` provides ANSI true-color gradient text. All color constants and lipgloss styles live in `styles.go`.
+Kanagawa/Tokyo Night dual-accent palette (cyan primary + violet secondary) defined in `tui/styles.go`. `tui/gradient.go` provides ANSI true-color gradient text. All color constants and lipgloss styles live in `styles.go`. Micro-animations (focus pulse, shimmer hold, compare reveal) run via background tickers.
 
 ## Key conventions
 
