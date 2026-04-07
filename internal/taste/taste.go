@@ -124,7 +124,6 @@ func (e *Engine) PersonalizePreset(preset model.Preset, profile Profile) model.P
 	// Inject top language if preset doesn't already specify one
 	if params.Language == "" && len(profile.TopLanguages) > 0 {
 		params.Language = profile.TopLanguages[0]
-		p.Name = preset.Name + " " + profile.TopLanguages[0]
 	}
 
 	p.Params = params

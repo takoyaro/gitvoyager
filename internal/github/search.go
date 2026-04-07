@@ -20,8 +20,16 @@ var searchJSONFields = strings.Join([]string{
 func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]model.Repo, error) {
 	args := []string{"search", "repos"}
 
-	if params.Query != "" {
-		args = append(args, params.Query)
+	// Build the query string, appending exclusion qualifiers.
+	query := params.Query
+	for _, t := range params.ExcludeTopics {
+		query += " -topic:" + t
+	}
+	for _, o := range params.ExcludeOwners {
+		query += " -user:" + o
+	}
+	if query != "" {
+		args = append(args, query)
 	}
 
 	for _, topic := range params.Topics {
@@ -88,6 +96,25 @@ func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]
 			PushedAt:     r.PushedAt,
 			DiscoveredAt: now,
 		}
+	}
+
+	// Post-fetch filter: drop repos matching excluded keywords in name/description.
+	if len(params.ExcludeKeywords) > 0 {
+		filtered := repos[:0]
+		for _, r := range repos {
+			haystack := strings.ToLower(r.FullName + " " + r.Description)
+			excluded := false
+			for _, kw := range params.ExcludeKeywords {
+				if strings.Contains(haystack, strings.ToLower(kw)) {
+					excluded = true
+					break
+				}
+			}
+			if !excluded {
+				filtered = append(filtered, r)
+			}
+		}
+		repos = filtered
 	}
 
 	// Post-fetch filter: drop repos that haven't been pushed within MaxPushedAge.

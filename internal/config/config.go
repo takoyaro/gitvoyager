@@ -9,12 +9,19 @@ import (
 )
 
 type Config struct {
-	Search  SearchConfig  `toml:"search"`
-	Cache   CacheConfig   `toml:"cache"`
-	Display DisplayConfig `toml:"display"`
-	Clone   CloneConfig   `toml:"clone"`
-	Claude  ClaudeConfig  `toml:"claude"`
-	Local   LocalConfig   `toml:"local"`
+	Search     SearchConfig     `toml:"search"`
+	Cache      CacheConfig      `toml:"cache"`
+	Display    DisplayConfig    `toml:"display"`
+	Clone      CloneConfig      `toml:"clone"`
+	Claude     ClaudeConfig     `toml:"claude"`
+	Local      LocalConfig      `toml:"local"`
+	Exclusions ExclusionsConfig `toml:"exclusions"`
+}
+
+type ExclusionsConfig struct {
+	Keywords []string `toml:"keywords"` // excluded from name/description (post-fetch)
+	Topics   []string `toml:"topics"`   // -topic:x qualifier
+	Owners   []string `toml:"owners"`   // -user:x qualifier
 }
 
 type LocalConfig struct {

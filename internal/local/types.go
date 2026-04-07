@@ -4,17 +4,17 @@ import "time"
 
 // ProjectFingerprint describes a local project's tech stack.
 type ProjectFingerprint struct {
-	Path         string
-	Name         string // directory name
-	Language     string // primary language inferred from manifest
-	Dependencies []Dependency
-	ScannedAt    time.Time
+	Path         string       `json:"path"`
+	Name         string       `json:"name"`
+	Language     string       `json:"language"`
+	Dependencies []Dependency `json:"dependencies,omitempty"`
+	ScannedAt    time.Time    `json:"scanned_at"`
 }
 
 // Dependency represents a single package dependency.
 type Dependency struct {
-	Name     string // e.g., "github.com/charmbracelet/bubbletea" or "express"
-	Version  string
-	Source   string // manifest file: "go.mod", "package.json", etc.
-	RepoName string // mapped GitHub full_name, e.g., "charmbracelet/bubbletea"
+	Name     string `json:"name"`
+	Version  string `json:"version,omitempty"`
+	Source   string `json:"source,omitempty"`
+	RepoName string `json:"github_repo,omitempty"`
 }
