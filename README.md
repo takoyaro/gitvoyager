@@ -29,23 +29,15 @@ infinite time to browse.
 ## Install
 
 Requires **Go 1.25+** and an authenticated **[`gh` CLI](https://cli.github.com)**.
+Optional: **[`claude` CLI](https://docs.anthropic.com/en/docs/claude-code)** for AI features (auto-detected on startup).
 
 ```bash
-# one-liner (no clone needed)
-go install github.com/takoyaro/gitvoyager/cmd/gitvoyager@latest
-
-# — or from source —
 git clone https://github.com/takoyaro/gitvoyager.git
 cd gitvoyager
 make install
 ```
 
 Binary lands in `$GOPATH/bin` — make sure that's on your `PATH`.
-
-### Releases
-
-Pre-built binaries for Linux, macOS, and Windows (amd64 / arm64) are available
-on the [Releases](https://github.com/takoyaro/gitvoyager/releases) page.
 
 ## Usage
 
@@ -78,7 +70,7 @@ pick based on your taste profile.
 | <kbd>X</kbd> | Exclusion manager | | <kbd>&larr;</kbd> / <kbd>&rarr;</kbd> | Cycle language filter |
 | <kbd>?</kbd> | Help | | <kbd>q</kbd> | Quit |
 
-### AI (requires Claude)
+### AI (requires [`claude` CLI](https://docs.anthropic.com/en/docs/claude-code))
 
 | Key | Action |
 |-----|--------|
@@ -134,7 +126,7 @@ All data follows XDG conventions:
 | `$XDG_CONFIG_HOME/gitvoyager/` | `config.toml` |
 | `$XDG_DATA_HOME/gitvoyager/` | `gitvoyager.db` (SQLite, WAL mode) |
 
-No telemetry. No network calls beyond `gh` CLI.
+No telemetry. Network calls go through `gh` CLI and, when AI features are enabled, the `claude` CLI.
 
 ## Building
 
