@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/takoyaro/gitvoyager/internal/claude"
@@ -82,6 +83,19 @@ Examples:
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+
+	if _, err := exec.LookPath("gh"); err != nil {
+		fmt.Fprintln(os.Stderr, "gh CLI not found — GitVoyager requires an authenticated gh session.")
+		fmt.Fprintln(os.Stderr, "Install: https://cli.github.com")
+		os.Exit(1)
+	}
+
+	if cfg.Claude.Enabled {
+		if _, err := exec.LookPath("claude"); err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: claude CLI not found — AI features disabled.")
+			cfg.Claude.Enabled = false
+		}
 	}
 
 	st, err := store.New(config.DBPath(), &cfg.Exclusions)
