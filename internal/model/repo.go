@@ -46,6 +46,11 @@ type Repo struct {
 	SeenAt       *time.Time `json:"seen_at,omitempty"`
 	Watchlisted  bool       `json:"watchlisted,omitempty"`
 	StarDelta    int        `json:"star_delta,omitempty"`
+
+	// Derived discovery signals
+	NewDiscovery bool    `json:"new_discovery,omitempty"`
+	Sleeper      bool    `json:"sleeper,omitempty"`
+	StarAccel    float64 `json:"star_accel,omitempty"` // velocity_7d / velocity_lifetime; >1.0 = accelerating
 }
 
 type SortField string
@@ -56,9 +61,10 @@ const (
 	SortForks     SortField = "forks"
 	SortBestMatch SortField = "best-match"
 	SortScore     SortField = "score"
+	SortDiscovery SortField = "discovery"
 )
 
-var SortCycle = []SortField{SortStars, SortUpdated, SortForks, SortBestMatch, SortScore}
+var SortCycle = []SortField{SortDiscovery, SortStars, SortUpdated, SortForks, SortBestMatch, SortScore}
 
 // PostFilter names a two-phase post-fetch scoring/filtering strategy.
 type PostFilter string
@@ -89,7 +95,7 @@ type SearchParams struct {
 
 func DefaultSearchParams() SearchParams {
 	return SearchParams{
-		Sort:  SortStars,
+		Sort:  SortDiscovery,
 		Order: "desc",
 		Limit: 30,
 	}
@@ -193,6 +199,9 @@ func ComputeScores(repos []Repo) {
 			math.Log(float64(r.Forks)+1)*2.0+
 			math.Log(float64(r.OpenIssues)+1)*1.5+
 			recencyBonus*3.0) / math.Log(ageDays+1)
+
+		// Sleeper: actively maintained but unnoticed
+		r.Sleeper = recencyDays < 14 && r.Stars < 200 && ageDays > 180
 	}
 	computeStarPercentiles(repos)
 }
@@ -227,6 +236,52 @@ func SortByScore(repos []Repo) {
 	sort.Slice(repos, func(i, j int) bool {
 		return repos[i].DiscoveryScore > repos[j].DiscoveryScore
 	})
+}
+
+// SortByDiscovery implements the default "smart" sort:
+//
+//	Tier 0: Unseen new discoveries, sleepers first, then by DiscoveryScore
+//	Tier 1: Known unseen repos, by acceleration then DiscoveryScore
+//	Tier 2: Previously seen repos, by acceleration then DiscoveryScore
+func SortByDiscovery(repos []Repo, seenSet map[string]bool) {
+	sort.SliceStable(repos, func(i, j int) bool {
+		ri, rj := &repos[i], &repos[j]
+
+		tierI := repoTier(ri, seenSet)
+		tierJ := repoTier(rj, seenSet)
+		if tierI != tierJ {
+			return tierI < tierJ
+		}
+
+		// Within tier 0: sleepers float to very top
+		if tierI == 0 && ri.Sleeper != rj.Sleeper {
+			return ri.Sleeper
+		}
+
+		// Within tiers 1 and 2: accelerating repos first
+		if tierI >= 1 {
+			accelI := ri.StarAccel > 1.0
+			accelJ := rj.StarAccel > 1.0
+			if accelI != accelJ {
+				return accelI
+			}
+			if accelI && accelJ && ri.StarAccel != rj.StarAccel {
+				return ri.StarAccel > rj.StarAccel
+			}
+		}
+
+		return ri.DiscoveryScore > rj.DiscoveryScore
+	})
+}
+
+func repoTier(r *Repo, seenSet map[string]bool) int {
+	if seenSet != nil && seenSet[r.FullName] {
+		return 2 // seen
+	}
+	if r.NewDiscovery {
+		return 0 // unseen + new to DB
+	}
+	return 1 // unseen + already in DB
 }
 
 // ApplyFreshSignalFilter scores repos on quality/freshness signals, sorts by

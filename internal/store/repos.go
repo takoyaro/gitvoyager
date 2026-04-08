@@ -157,6 +157,40 @@ func (s *Store) GetFirstSeenStars(fullNames []string) (map[string]int, error) {
 	return result, rows.Err()
 }
 
+// CheckExistingRepos returns the set of full_names that already exist in the repos table.
+// Called before UpsertRepos to detect genuinely new discoveries.
+func (s *Store) CheckExistingRepos(fullNames []string) (map[string]bool, error) {
+	if len(fullNames) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat("?,", len(fullNames))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	args := make([]any, len(fullNames))
+	for i, n := range fullNames {
+		args[i] = n
+	}
+
+	rows, err := s.db.Query(
+		`SELECT full_name FROM repos WHERE full_name IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool, len(fullNames))
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		existing[name] = true
+	}
+	return existing, rows.Err()
+}
+
 // GetWatchlistRepos returns full repo data for all watched repos, with StarDelta pre-computed.
 func (s *Store) GetWatchlistRepos() ([]model.Repo, error) {
 	rows, err := s.db.Query(`

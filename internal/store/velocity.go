@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"time"
 
 	"github.com/takoyaro/gitvoyager/internal/model"
@@ -135,4 +136,66 @@ func (s *Store) GetFastestRising(limit int) ([]model.Repo, error) {
 		repos = append(repos, r)
 	}
 	return repos, rows.Err()
+}
+
+// GetBatchStarAcceleration returns the 7-day star acceleration ratio for each repo.
+// acceleration = velocity_7d / velocity_lifetime. Values > 1.0 mean accelerating growth.
+func (s *Store) GetBatchStarAcceleration(fullNames []string) (map[string]float64, error) {
+	if len(fullNames) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat("?,", len(fullNames))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	cutoff := time.Now().AddDate(0, 0, -7).Format(time.RFC3339)
+
+	args := make([]any, 0, len(fullNames)+1)
+	args = append(args, cutoff)
+	for _, n := range fullNames {
+		args = append(args, n)
+	}
+
+	rows, err := s.db.Query(`
+		WITH window_velocity AS (
+			SELECT
+				full_name,
+				MAX(stars) - MIN(stars) AS star_gain_7d,
+				(julianday(MAX(recorded_at)) - julianday(MIN(recorded_at))) AS days_span
+			FROM star_snapshots
+			WHERE recorded_at >= ? AND full_name IN (`+placeholders+`)
+			GROUP BY full_name
+			HAVING days_span > 0.1
+		)
+		SELECT wv.full_name, wv.star_gain_7d, wv.days_span,
+		       r.stars, r.created_at
+		FROM window_velocity wv
+		JOIN repos r ON r.full_name = wv.full_name
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	now := time.Now()
+	result := make(map[string]float64, len(fullNames))
+	for rows.Next() {
+		var name, createdAt string
+		var gain7d, stars int
+		var daysSpan float64
+		if err := rows.Scan(&name, &gain7d, &daysSpan, &stars, &createdAt); err != nil {
+			return nil, err
+		}
+		created, _ := time.Parse(time.RFC3339, createdAt)
+		ageDays := now.Sub(created).Hours() / 24
+		if ageDays < 1 {
+			ageDays = 1
+		}
+		velocityLifetime := float64(stars) / ageDays
+		velocity7d := float64(gain7d) / 7.0
+
+		if velocityLifetime > 0.001 {
+			result[name] = velocity7d / velocityLifetime
+		}
+	}
+	return result, rows.Err()
 }
