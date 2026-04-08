@@ -50,7 +50,7 @@ var keys = keyMap{
 	),
 	Back: key.NewBinding(
 		key.WithKeys("h"),
-		key.WithHelp("h", "back"),
+		key.WithHelp("h", "home"),
 	),
 	Search: key.NewBinding(
 		key.WithKeys("/"),
