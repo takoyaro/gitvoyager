@@ -248,9 +248,23 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case searchResultsMsg:
 		m.repos = msg.Repos
 		model.ComputeScores(m.repos)
+
+		// Mark new discoveries (repos not in DB before this search)
+		if msg.KnownRepos != nil {
+			for i := range m.repos {
+				m.repos[i].NewDiscovery = !msg.KnownRepos[m.repos[i].FullName]
+			}
+		}
+
 		for i := range m.repos {
 			m.repos[i].Watchlisted = m.watchSet[m.repos[i].FullName]
 		}
+
+		// Apply discovery sort as default view
+		if m.searchParams.Sort == model.SortDiscovery {
+			model.SortByDiscovery(m.repos, m.list.seenSet)
+		}
+
 		m.loading = false
 		m.statusBar.SetLoading(false)
 		// Hold skeleton visible briefly for crossfade effect
@@ -278,14 +292,47 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case starDeltasLoadedMsg:
+		changed := false
 		if len(msg.FirstSeenStars) > 0 {
 			for i := range m.repos {
 				if first, ok := msg.FirstSeenStars[m.repos[i].FullName]; ok {
 					m.repos[i].StarDelta = m.repos[i].Stars - first
+					changed = true
 				}
 			}
-			m.list.SetRepos(m.repos)
-			m.list.SetWatched(m.watchSet)
+		}
+		if len(msg.Acceleration) > 0 {
+			for i := range m.repos {
+				if accel, ok := msg.Acceleration[m.repos[i].FullName]; ok {
+					m.repos[i].StarAccel = accel
+					changed = true
+				}
+			}
+		}
+		if changed {
+			// Re-sort with acceleration data now available
+			if m.searchParams.Sort == model.SortDiscovery {
+				// Preserve selected repo across re-sort
+				var selectedName string
+				if sel := m.list.Selected(); sel != nil {
+					selectedName = sel.FullName
+				}
+				model.SortByDiscovery(m.repos, m.list.seenSet)
+				m.list.SetRepos(m.repos)
+				m.list.SetWatched(m.watchSet)
+				// Restore cursor to previously selected repo
+				if selectedName != "" {
+					for i, idx := range m.list.filtered {
+						if m.list.repos[idx].FullName == selectedName {
+							m.list.cursor = i
+							break
+						}
+					}
+				}
+			} else {
+				m.list.SetRepos(m.repos)
+				m.list.SetWatched(m.watchSet)
+			}
 		}
 		return m, nil
 
@@ -857,7 +904,7 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.searchBar.Value() == "" {
 		switch msg.String() {
 		case "h":
-			// "h" (back) on empty search bar is a no-op — user is already home
+			// "h" (home) on empty search bar is a no-op — user is already home
 			return m, nil
 		case "1":
 			return m.launchPreset(0)
@@ -1176,7 +1223,14 @@ func (m *appModel) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.state == stateWatchlist {
 			return m.toggleWatchlistState()
 		}
-		// Non-destructive: keep results visible, just focus search bar
+		// Return to home — clear results so View renders the landing screen
+		m.repos = nil
+		m.list.SetRepos(nil)
+		m.detail.SetRepo(nil)
+		m.searchBar.Reset()
+		m.searchBar.SetQuery("")
+		m.searchBar.SetCount(0)
+		m.state = stateSearchPrompt
 		m.focus = paneSearch
 		m.searchBar.Focus()
 		return m, m.searchBar.input.Focus()
@@ -1408,9 +1462,18 @@ func (m *appModel) cycleSort() tea.Cmd {
 		}
 	}
 
-	if m.searchParams.Sort == model.SortScore {
+	// Client-side sorts (no re-fetch needed)
+	switch m.searchParams.Sort {
+	case model.SortScore:
 		if len(m.repos) > 0 {
 			model.SortByScore(m.repos)
+			m.list.SetRepos(m.repos)
+			m.list.SetWatched(m.watchSet)
+		}
+		return nil
+	case model.SortDiscovery:
+		if len(m.repos) > 0 {
+			model.SortByDiscovery(m.repos, m.list.seenSet)
 			m.list.SetRepos(m.repos)
 			m.list.SetWatched(m.watchSet)
 		}

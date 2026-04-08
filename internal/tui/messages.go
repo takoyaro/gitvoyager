@@ -12,8 +12,9 @@ import (
 
 // Search
 type searchResultsMsg struct {
-	Repos []model.Repo
-	Query string
+	Repos      []model.Repo
+	Query      string
+	KnownRepos map[string]bool // repos that existed in DB before this search
 }
 
 type searchErrorMsg struct{ Err error }
@@ -95,6 +96,7 @@ type watchlistRefreshedMsg struct {
 // Star velocity
 type starDeltasLoadedMsg struct {
 	FirstSeenStars map[string]int
+	Acceleration   map[string]float64
 }
 
 // Spinner / rate limit tick

@@ -22,11 +22,19 @@ func searchReposCmd(client *github.Client, st *store.Store, params model.SearchP
 		if err != nil {
 			return searchErrorMsg{Err: err}
 		}
+		var knownRepos map[string]bool
 		if st != nil {
+			// Detect new discoveries BEFORE upsert (critical ordering)
+			names := make([]string, len(repos))
+			for i, r := range repos {
+				names[i] = r.FullName
+			}
+			knownRepos, _ = st.CheckExistingRepos(names)
+
 			_ = st.UpsertRepos(repos)
 			_ = st.RecordStarSnapshots(repos)
 		}
-		return searchResultsMsg{Repos: repos, Query: params.Query}
+		return searchResultsMsg{Repos: repos, Query: params.Query, KnownRepos: knownRepos}
 	}
 }
 
@@ -152,7 +160,9 @@ func loadStarDeltasCmd(st *store.Store, repos []model.Repo) tea.Cmd {
 		if err != nil {
 			return starDeltasLoadedMsg{}
 		}
-		return starDeltasLoadedMsg{FirstSeenStars: firstSeen}
+		// Batch-load acceleration in the same round-trip
+		accel, _ := st.GetBatchStarAcceleration(names)
+		return starDeltasLoadedMsg{FirstSeenStars: firstSeen, Acceleration: accel}
 	}
 }
 
