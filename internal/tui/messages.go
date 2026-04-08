@@ -177,6 +177,32 @@ type exclusionUpdatedMsg struct {
 	Added bool // true = added, false = removed
 }
 
+// README analysis (runs off main thread)
+type readmeAnalyzedMsg struct {
+	FullName string
+	Score    float64
+}
+
+// Batch intrinsic probe results
+type batchIntrinsicMsg struct {
+	Signals map[string]*model.IntrinsicSignals
+	Topics  map[string][]string
+	Err     error
+}
+
+// Topic heat
+type topicHeatDelayMsg struct{} // fires after startup delay before sampling
+type topicHeatSampledMsg struct {
+	HeatMap map[string]float64 // topic → acceleration ratio
+	Err     error
+}
+
+// Async local scan for "like" search
+type likeSearchReadyMsg struct {
+	Query string
+	Path  string
+}
+
 // Session quit
 type quitTimerMsg struct{}
 

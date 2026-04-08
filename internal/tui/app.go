@@ -124,6 +124,9 @@ type appModel struct {
 	summarizing      bool
 	suggestedTopics  []string // topic drift suggestions
 
+	// Topic heat
+	topicHeatMap map[string]float64
+
 	// Dependencies
 	cfg    *config.Config
 	store  *store.Store
@@ -197,6 +200,9 @@ func (m *appModel) Init() tea.Cmd {
 	// Sync starred repos (debounced, max once per 24h)
 	cmds = append(cmds, syncStarredReposCmd(m.github, m.store))
 
+	// Delay topic heat sampling to avoid competing with the user's first search.
+	cmds = append(cmds, delayedTopicHeatCmd(m.store))
+
 	if m.searchParams.Query != "" {
 		m.loading = true
 		m.list.SetLoading(true)
@@ -247,6 +253,10 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case searchResultsMsg:
 		m.repos = msg.Repos
+		// Apply topic heat boosts before scoring.
+		if m.topicHeatMap != nil {
+			model.ApplyTopicHeatBoosts(m.repos, m.topicHeatMap)
+		}
 		model.ComputeScores(m.repos)
 
 		// Mark new discoveries (repos not in DB before this search)
@@ -277,19 +287,65 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBar.SetCounts(len(m.repos), m.list.Len())
 		m.state = stateBrowsing
 		m.focus = paneList
-		if m.store != nil && msg.Query != "" {
-			_ = m.store.SaveSearch(msg.Query, string(m.searchParams.Sort), m.searchParams.Language, len(m.repos))
-		}
 		var cmds []tea.Cmd
+		if m.store != nil && msg.Query != "" {
+			cmds = append(cmds, saveSearchCmd(m.store, msg.Query, string(m.searchParams.Sort), m.searchParams.Language, len(m.repos)))
+		}
 		cmds = append(cmds, shimmerHoldCmd())
 		if sel := m.list.Selected(); sel != nil {
 			m.detailTag++
 			cmds = append(cmds, debounceDetailCmd(m.detailTag, 100*time.Millisecond))
 		}
 		cmds = append(cmds, loadStarDeltasCmd(m.store, m.repos))
+		// Fire batch intrinsic probe for quality grades in the list.
+		cmds = append(cmds, batchIntrinsicProbeCmd(m.github, m.repos))
 		// Clear topic drift for new search
 		m.suggestedTopics = nil
 		return m, tea.Batch(cmds...)
+
+	case batchIntrinsicMsg:
+		if msg.Err != nil || msg.Signals == nil || len(m.repos) == 0 {
+			return m, nil
+		}
+		// Don't re-sort if the user has an overlay/picker active.
+		if m.excludePickerMode || m.exclusionMgr.IsActive() || m.peek.IsActive() {
+			return m, nil
+		}
+		for i := range m.repos {
+			if sig, ok := msg.Signals[m.repos[i].FullName]; ok {
+				m.repos[i].Intrinsic = sig
+				model.ComputeIntrinsicScore(&m.repos[i])
+			}
+			if topics, ok := msg.Topics[m.repos[i].FullName]; ok && len(m.repos[i].Topics) == 0 {
+				m.repos[i].Topics = topics
+			}
+		}
+		// Reapply topic heat boosts now that topics are available.
+		if m.topicHeatMap != nil {
+			model.ApplyTopicHeatBoosts(m.repos, m.topicHeatMap)
+		}
+		model.ComputeScores(m.repos)
+
+		// Preserve cursor across re-sort.
+		var selectedName string
+		if sel := m.list.Selected(); sel != nil {
+			selectedName = sel.FullName
+		}
+		if m.searchParams.Sort == model.SortDiscovery {
+			model.SortByDiscovery(m.repos, m.list.seenSet)
+		}
+		m.list.SetRepos(m.repos)
+		m.list.SetWatched(m.watchSet)
+		// Restore cursor.
+		if selectedName != "" {
+			for i, idx := range m.list.filtered {
+				if m.list.repos[idx].FullName == selectedName {
+					m.list.cursor = i
+					break
+				}
+			}
+		}
+		return m, nil
 
 	case starDeltasLoadedMsg:
 		changed := false
@@ -358,21 +414,33 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.SetAIAnalysis(analysis)
 		}
 		m.sessionViewed++
-		if m.store != nil {
-			_ = m.store.MarkSeen(sel.FullName)
-			m.list.seenSet[sel.FullName] = true
-		}
-		return m, tea.Batch(
-			enrichRepoCmd(m.github, *sel),
+		cmds := []tea.Cmd{
+			enrichRepoCmd(m.github, m.store, *sel),
 			fetchReadmeCmd(m.github, sel.Owner, sel.Name),
-		)
+		}
+		if m.store != nil {
+			m.list.seenSet[sel.FullName] = true
+			cmds = append(cmds, markSeenCmd(m.store, sel.FullName))
+		}
+		return m, tea.Batch(cmds...)
 
 	case repoDetailMsg:
 		var cmds []tea.Cmd
+		applyEnrichment := func(r *model.Repo) {
+			r.Topics = msg.Repo.Topics
+			r.Enriched = msg.Repo.Enriched
+			r.WatcherCount = msg.Repo.WatcherCount
+			r.ContributorCount = msg.Repo.ContributorCount
+			r.OpenPRCount = msg.Repo.OpenPRCount
+			r.CommitCount = msg.Repo.CommitCount
+			r.LatestReleaseTag = msg.Repo.LatestReleaseTag
+			r.LatestReleaseAt = msg.Repo.LatestReleaseAt
+			r.Intrinsic = msg.Repo.Intrinsic
+			r.IntrinsicScore = msg.Repo.IntrinsicScore
+		}
 		for i, r := range m.repos {
 			if r.FullName == msg.Repo.FullName {
-				m.repos[i].Topics = msg.Repo.Topics
-				m.repos[i].Enriched = msg.Repo.Enriched
+				applyEnrichment(&m.repos[i])
 				if sel := m.list.Selected(); sel != nil && sel.FullName == msg.Repo.FullName {
 					m.detail.UpdateRepo(&m.repos[i])
 				}
@@ -381,8 +449,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		for i, r := range m.watchlistRepos {
 			if r.FullName == msg.Repo.FullName {
-				m.watchlistRepos[i].Topics = msg.Repo.Topics
-				m.watchlistRepos[i].Enriched = msg.Repo.Enriched
+				applyEnrichment(&m.watchlistRepos[i])
 				if sel := m.watchlistList.Selected(); sel != nil && sel.FullName == msg.Repo.FullName {
 					m.detail.UpdateRepo(&m.watchlistRepos[i])
 				}
@@ -422,6 +489,34 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if summary, ok := m.claudeSummaries[msg.FullName]; ok {
 					m.detail.SetAISummary(summary)
 				}
+			}
+
+			// Analyze README off the main thread.
+			if msg.Content != "" {
+				return m, analyzeReadmeCmd(msg.FullName, msg.Content)
+			}
+		}
+		return m, nil
+
+	case readmeAnalyzedMsg:
+		for i, r := range m.repos {
+			if r.FullName == msg.FullName {
+				m.repos[i].ReadmeScore = msg.Score
+				model.ComputeIntrinsicScore(&m.repos[i])
+				if sel := m.list.Selected(); sel != nil && sel.FullName == msg.FullName {
+					m.detail.UpdateRepo(&m.repos[i])
+				}
+				break
+			}
+		}
+		for i, r := range m.watchlistRepos {
+			if r.FullName == msg.FullName {
+				m.watchlistRepos[i].ReadmeScore = msg.Score
+				model.ComputeIntrinsicScore(&m.watchlistRepos[i])
+				if sel := m.watchlistList.Selected(); sel != nil && sel.FullName == msg.FullName {
+					m.detail.UpdateRepo(&m.watchlistRepos[i])
+				}
+				break
 			}
 		}
 		return m, nil
@@ -567,7 +662,7 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.watchlistList.SetRepos(m.watchlistRepos)
 		m.watchlistList.SetWatched(m.watchSet)
 		if m.store != nil {
-			_ = m.store.UpsertRepos(m.watchlistRepos)
+			return m, asyncUpsertReposCmd(m.store, m.watchlistRepos)
 		}
 		return m, nil
 
@@ -737,6 +832,30 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case topicHeatDelayMsg:
+		return m, sampleTopicHeatCmd(m.github, m.store)
+
+	case topicHeatSampledMsg:
+		if msg.Err == nil && msg.HeatMap != nil {
+			m.topicHeatMap = msg.HeatMap
+		}
+		return m, nil
+
+	case likeSearchReadyMsg:
+		if msg.Query == "" {
+			m.loading = false
+			m.list.SetLoading(false)
+			m.statusBar.SetLoading(false)
+			m.statusBar.SetMessage("Could not scan project", true)
+			return m, clearStatusAfter(3 * time.Second)
+		}
+		m.searchParams.Query = msg.Query
+		m.statusBar.SetMessage("Finding repos like "+msg.Path, false)
+		return m, tea.Batch(
+			searchReposCmd(m.github, m.store, m.searchParams),
+			fetchRateLimitCmd(m.github),
+		)
+
 	case returnVisitMsg:
 		if len(msg.Repos) > 0 && m.state == stateSearchPrompt && len(m.repos) == 0 {
 			m.returnVisitRepos = msg.Repos
@@ -835,13 +954,12 @@ func (m *appModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m *appModel) toggleWatchlistState() (tea.Model, tea.Cmd) {
 	if m.state == stateWatchlist {
-		// Stamp last viewed when leaving watchlist
-		if m.store != nil {
-			_ = m.store.UpdateWatchlistViewedAt()
-		}
 		m.state = stateBrowsing
 		m.list.isWatchlist = false
 		m.focus = paneList
+		if m.store != nil {
+			return m, updateWatchlistViewedAtCmd(m.store)
+		}
 		return m, nil
 	}
 	m.state = stateWatchlist
@@ -894,6 +1012,41 @@ func (m *appModel) launchPreset(idx int) (tea.Model, tea.Cmd) {
 	)
 }
 
+func (m *appModel) launchHotSpacePreset() (tea.Model, tea.Cmd) {
+	var hotTopics []string
+	if m.topicHeatMap != nil {
+		// Get top 3 accelerating topics.
+		type th struct {
+			topic string
+			accel float64
+		}
+		var all []th
+		for t, a := range m.topicHeatMap {
+			if a > 1.0 {
+				all = append(all, th{t, a})
+			}
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].accel > all[j].accel })
+		for i := 0; i < len(all) && i < 3; i++ {
+			hotTopics = append(hotTopics, all[i].topic)
+		}
+	}
+	if len(hotTopics) == 0 {
+		hotTopics = []string{"mcp", "ai-agent", "claude-code"}
+	}
+	p := model.GetHotSpacePreset(hotTopics)
+	m.searchParams = p.Params
+	m.applyGlobalExclusions()
+	m.loading = true
+	m.searchBar.Blur()
+	m.focus = paneList
+	m.historyCursor = -1
+	return m, tea.Batch(
+		searchReposCmd(m.github, m.store, m.searchParams),
+		fetchRateLimitCmd(m.github),
+	)
+}
+
 func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Route to form handler when form mode is active
 	if m.formMode {
@@ -916,6 +1069,16 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m.launchPreset(3)
 		case "5":
 			return m.launchPreset(4)
+		case "6":
+			return m.launchPreset(5)
+		case "7":
+			return m.launchPreset(6)
+		case "8":
+			return m.launchPreset(7)
+		case "9":
+			return m.launchPreset(8)
+		case "0":
+			return m.launchHotSpacePreset()
 		case "a":
 			m.formMode = true
 			return m, m.searchForm.Focus()
@@ -1004,28 +1167,23 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// "like" — seed search from local project fingerprint
+		// "like" — seed search from local project fingerprint (async scan)
 		if strings.HasPrefix(query, "like ") || query == "like" {
 			path := strings.TrimPrefix(query, "like ")
 			if path == "" || path == "like" {
 				path = "."
 			}
-			likeQuery := m.buildLikeSearch(path)
-			if likeQuery != "" {
-				m.searchParams.Query = likeQuery
-				m.loading = true
-				m.list.SetLoading(true)
-				m.statusBar.SetLoading(true)
-				m.searchBar.Blur()
-				m.focus = paneList
-				m.historyCursor = -1
-				m.statusBar.SetMessage("Finding repos like "+path, false)
-				return m, tea.Batch(
-					searchReposCmd(m.github, m.store, m.searchParams),
-					fetchRateLimitCmd(m.github),
-					spinnerTickCmd(),
-				)
-			}
+			m.loading = true
+			m.list.SetLoading(true)
+			m.statusBar.SetLoading(true)
+			m.searchBar.Blur()
+			m.focus = paneList
+			m.historyCursor = -1
+			m.statusBar.SetMessage("Scanning "+path+"...", false)
+			return m, tea.Batch(
+				likeSearchCmd(m.localScanner, m.store, path),
+				spinnerTickCmd(),
+			)
 		}
 
 		// NL search mode: route through Claude for translation
@@ -1077,8 +1235,8 @@ func (m *appModel) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case msg.String() == "ctrl+b":
 		if m.historyCursor >= 0 && m.historyCursor < len(m.searchHistory) && m.store != nil {
 			item := &m.searchHistory[m.historyCursor]
-			_ = m.store.ToggleSearchBookmark(item.ID)
 			item.Bookmarked = !item.Bookmarked
+			return m, toggleSearchBookmarkCmd(m.store, item.ID)
 		}
 		return m, nil
 
@@ -1863,24 +2021,8 @@ func (m *appModel) renderSearchPrompt() string {
 		return m.renderFormView()
 	}
 
-	// ── Gradient logo ──
-	logoLines := []string{
-		" ██████╗ ██╗████████╗",
-		"██╔════╝ ██║╚══██╔══╝",
-		"██║  ███╗██║   ██║   ",
-		"██║   ██║██║   ██║   ",
-		"╚██████╔╝██║   ██║   ",
-		" ╚═════╝ ╚═╝   ╚═╝   ",
-	}
-	var logo strings.Builder
-	for _, line := range logoLines {
-		logo.WriteString(GradientText(line, "#22D3EE", "#818CF8"))
-		logo.WriteByte('\n')
-	}
-	logoStr := logo.String()
-	voyager := GradientText("  VOYAGER", "#22D3EE", "#C084FC")
-	logoStr += voyager
-
+	// ── Compact gradient logo (2 lines) ──
+	logoStr := "  " + GradientText("◈  G I T   V O Y A G E R", "#22D3EE", "#C084FC")
 	subtitle := styleMuted.Render("  discover underdogs ") +
 		styleAccent.Render("·") +
 		styleMuted.Render(" surface hidden gems ") +
@@ -1943,13 +2085,15 @@ func (m *appModel) renderSearchPrompt() string {
 
 	// ── Preset cards (responsive grid) ──
 	presets := model.GetPresets()
-	icons := []string{"✦", "◈", "⚡", "◎"}
+	hotSpace := model.GetHotSpacePreset(nil)
+
+	// Icons for the top 4 discovery presets (shown as hero cards).
+	cardIcons := []string{"◈", "✦", "⚡", "◎"}
 	singleColCards := m.width < 65
-	cardW := 26
+	// Derive card width from searchBoxW so the 2-card row matches bordered elements.
+	cardW := (searchBoxW - 2) / 2 // two cards + 2-char gap = searchBoxW
 	if singleColCards {
-		cardW = min(26, m.width-6)
-	} else {
-		cardW = min(26, (m.width-8)/2)
+		cardW = min(searchBoxW, m.width-6)
 	}
 	if cardW < 16 {
 		cardW = 16
@@ -1958,8 +2102,8 @@ func (m *appModel) renderSearchPrompt() string {
 	// Animated border colors for first-launch carousel
 	carouselColors := []color.Color{colorAccentPulse, colorAccentViolet, colorAccentCyan, colorGoldStar}
 
-	renderCard := func(idx int, p model.Preset) string {
-		icon := styleCyan.Render(icons[idx])
+	renderCard := func(idx int, p model.Preset, icon string) string {
+		iconStr := styleCyan.Render(icon)
 		name := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render(p.Name)
 		desc := styleMuted.Render(p.Description)
 		if len(p.Description) > cardW-4 {
@@ -1968,7 +2112,7 @@ func (m *appModel) renderSearchPrompt() string {
 		key := styleMuted.Render("[" + p.Key + "]")
 
 		inner := lipgloss.JoinVertical(lipgloss.Left,
-			icon+" "+name,
+			iconStr+" "+name,
 			desc,
 			lipgloss.PlaceHorizontal(cardW-4, lipgloss.Right, key),
 		)
@@ -1990,21 +2134,93 @@ func (m *appModel) renderSearchPrompt() string {
 
 	var cardRows []string
 	if singleColCards {
-		// Vertical stack
-		for i, p := range presets {
-			cardRows = append(cardRows, renderCard(i, p))
+		for i := 0; i < 4 && i < len(presets); i++ {
+			cardRows = append(cardRows, renderCard(i, presets[i], cardIcons[i]))
 		}
 	} else {
-		// 2×2 grid
+		// 2×2 grid for top 4 presets
 		if len(presets) >= 2 {
 			cardRows = append(cardRows, lipgloss.JoinHorizontal(lipgloss.Top,
-				renderCard(0, presets[0]), "  ", renderCard(1, presets[1])))
+				renderCard(0, presets[0], cardIcons[0]), "  ", renderCard(1, presets[1], cardIcons[1])))
 		}
 		if len(presets) >= 4 {
 			cardRows = append(cardRows, lipgloss.JoinHorizontal(lipgloss.Top,
-				renderCard(2, presets[2]), "  ", renderCard(3, presets[3])))
+				renderCard(2, presets[2], cardIcons[2]), "  ", renderCard(3, presets[3], cardIcons[3])))
 		}
 	}
+
+	// ── Extended expedition strip (presets 5-9 + Hot Space [0]) ──
+	type presetPill struct {
+		key   string
+		name  string
+		icon  string
+		color color.Color
+	}
+	expPills := []presetPill{
+		{"5", "Craft", "◆", colorGoldStar},
+		{"6", "Rising", "↗", colorGreenGrow},
+		{"7", "Agent", "⬡", colorAccentPulse},
+		{"8", "Magnets", "♥", colorRedAlert},
+		{"9", "Trending", "~", colorFgMuted},
+		{"0", "Hot Space", "♨", colorAccentPulse},
+	}
+
+	// Annotate Hot Space pill with top accelerating topic if available.
+	if m.topicHeatMap != nil && len(m.topicHeatMap) > 0 {
+		type kv struct {
+			t string
+			a float64
+		}
+		var sorted []kv
+		for t, a := range m.topicHeatMap {
+			if a > 1.0 {
+				sorted = append(sorted, kv{t, a})
+			}
+		}
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].a > sorted[j].a })
+		if len(sorted) > 0 {
+			// Add top topic annotation to Hot Space pill
+			expPills[5].name = fmt.Sprintf("Hot Space (%s %.1fx)", sorted[0].t, sorted[0].a)
+		}
+	}
+
+	var pillParts []string
+	for _, p := range expPills {
+		icon := lipgloss.NewStyle().Foreground(p.color).Render(p.icon)
+		name := lipgloss.NewStyle().Foreground(colorFgSecondary).Render(p.name)
+		key := styleGhost.Render("[" + p.key + "]")
+		pillParts = append(pillParts, icon+" "+name+" "+key)
+	}
+
+	// Lay out pills in rows that fit the terminal width.
+	pillSep := styleMuted.Render("  ")
+	var pillRows []string
+	currentRow := "  "
+	currentRowW := 2
+	for i, part := range pillParts {
+		partW := lipgloss.Width(part)
+		sepW := 0
+		if i > 0 && currentRowW > 2 {
+			sepW = lipgloss.Width(pillSep)
+		}
+		if currentRowW+sepW+partW > searchBoxW && currentRowW > 2 {
+			pillRows = append(pillRows, currentRow)
+			currentRow = "  " + part
+			currentRowW = 2 + partW
+		} else {
+			if currentRowW > 2 {
+				currentRow += pillSep
+				currentRowW += sepW
+			}
+			currentRow += part
+			currentRowW += partW
+		}
+	}
+	if currentRowW > 2 {
+		pillRows = append(pillRows, currentRow)
+	}
+
+	_ = hotSpace // used for dynamic preset launch
 
 	// ── History ──
 	var historyBlock string
@@ -2039,28 +2255,58 @@ func (m *appModel) renderSearchPrompt() string {
 		historyBlock = lipgloss.JoinVertical(lipgloss.Left, hLines...)
 	}
 
-	// ── Compose ──
+	// ── Compose (discovery-first zone order) ──
+	//
+	// Zone 0: Compact logo + subtitle
+	// Zone 1: Signal Board (topic heat hero)
+	// Zone 2: Surprise Pick (hero card)
+	// Zone 3: Return Visit Banner (your discoveries are growing)
+	// Zone 4: Search input + hints + language filter
+	// Zone 5: Discovery expedition cards (2x2)
+	// Zone 6: More expeditions pill strip
+	// Zone 7: Search history
+
 	parts := []string{
 		logoStr,
 		subtitle,
-		"",
-		inputBox,
-		"  " + examples,
 	}
+
+	// Zone 1: Signal Board
+	parts = append(parts, "", m.renderSignalBoard())
+
+	// Zone 2: Surprise Pick (hero)
+	if m.surprisePick != nil {
+		parts = append(parts, "", m.renderSurprisePickCard())
+	}
+
+	// Zone 3: Return Visit
+	if len(m.returnVisitRepos) > 0 {
+		parts = append(parts, "", m.renderReturnVisitBanner())
+	}
+
+	// Zone 4: Search input
+	parts = append(parts, "", inputBox, "  "+examples)
 	if langIndicator != "" {
 		parts = append(parts, langIndicator)
 	} else {
 		parts = append(parts, "")
 	}
-	if len(m.returnVisitRepos) > 0 {
-		parts = append(parts, "", m.renderReturnVisitBanner())
-	}
+
+	// Zone 5: Discovery cards
 	for _, row := range cardRows {
 		parts = append(parts, row)
 	}
-	if m.surprisePick != nil {
-		parts = append(parts, "", m.renderSurprisePickCard())
+
+	// Zone 6: Extended expeditions strip
+	if len(pillRows) > 0 {
+		parts = append(parts, "")
+		parts = append(parts, "  "+styleMuted.Render("─── more expeditions ───"))
+		for _, row := range pillRows {
+			parts = append(parts, row)
+		}
 	}
+
+	// Zone 7: History
 	if historyBlock != "" {
 		parts = append(parts, "", historyBlock)
 	}
@@ -2069,25 +2315,159 @@ func (m *appModel) renderSearchPrompt() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
 }
 
+func (m *appModel) renderSignalBoard() string {
+	boardW := min(60, m.width-6)
+	if boardW < 30 {
+		boardW = 30
+	}
+	innerW := boardW - 4
+
+	var topicItems []string
+	if m.topicHeatMap != nil {
+		type kv struct {
+			t string
+			a float64
+		}
+		var sorted []kv
+		for t, a := range m.topicHeatMap {
+			if a > 1.0 {
+				sorted = append(sorted, kv{t, a})
+			}
+		}
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].a > sorted[j].a })
+		cap := 5
+		if m.width < 65 {
+			cap = 3
+		}
+		for i := 0; i < len(sorted) && i < cap; i++ {
+			ratio := fmt.Sprintf("%.1fx", sorted[i].a)
+			topicItems = append(topicItems,
+				lipgloss.NewStyle().Foreground(colorAccentPulse).Bold(true).Render(sorted[i].t)+
+					styleGhost.Render(" "+ratio))
+		}
+	}
+
+	if len(topicItems) == 0 {
+		// No data yet — shimmer placeholder
+		content := lipgloss.NewStyle().Foreground(colorFgMuted).Render("♨ sampling the void...")
+		return lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorFgGhost).
+			Padding(0, 1).
+			Width(boardW).
+			Render(content)
+	}
+
+	// Topic heat strip — wrap topics to fit within card width
+	sep := styleMuted.Render("  ")
+	var heatRows []string
+	currentRow := lipgloss.NewStyle().Foreground(colorAccentPulse).Render("♨") + "  "
+	currentW := 3 // icon + 2 spaces
+	for i, item := range topicItems {
+		itemW := lipgloss.Width(item)
+		sepW := 0
+		if i > 0 {
+			sepW = lipgloss.Width(sep)
+		}
+		if currentW+sepW+itemW > innerW && currentW > 3 {
+			heatRows = append(heatRows, currentRow)
+			currentRow = "   " + item // indent continuation
+			currentW = 3 + itemW
+		} else {
+			if i > 0 {
+				currentRow += sep
+				currentW += sepW
+			}
+			currentRow += item
+			currentW += itemW
+		}
+	}
+	heatRows = append(heatRows, currentRow)
+
+	var lines []string
+	lines = append(lines, heatRows...)
+
+	// Activity pulse line
+	var pulseItems []string
+	if len(m.returnVisitRepos) > 0 {
+		pulseItems = append(pulseItems,
+			lipgloss.NewStyle().Foreground(colorGreenGrow).Render(fmt.Sprintf("%d", len(m.returnVisitRepos)))+
+				styleMuted.Render(" watchlist movers"))
+	}
+	if !m.tasteProfile.Empty() {
+		langCount := len(m.tasteProfile.TopLanguages)
+		if langCount > 0 {
+			pulseItems = append(pulseItems,
+				lipgloss.NewStyle().Foreground(colorAccentCyan).Render(fmt.Sprintf("%d", langCount))+
+					styleMuted.Render(" taste signals"))
+		}
+	}
+	if len(pulseItems) > 0 {
+		lines = append(lines, styleGhost.Render("↗")+" "+strings.Join(pulseItems, styleMuted.Render("  ·  ")))
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorFgGhost).
+		Padding(0, 1).
+		Width(boardW).
+		Render(content)
+}
+
 func (m *appModel) renderSurprisePickCard() string {
 	r := m.surprisePick
-	label := stylePulse.Render("  ⚡ Surprise Pick")
-	name := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render("  " + r.FullName)
-	lang := ""
-	if r.Language != "" {
-		lang = lipgloss.NewStyle().Foreground(langColor(r.Language)).Render("● " + r.Language)
+	cardW := min(60, m.width-6)
+	if cardW < 30 {
+		cardW = 30
 	}
-	stars := styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
-	desc := ""
+	innerW := cardW - 4
+
+	// Header: icon + label + [S] hint right-aligned
+	label := stylePulse.Render("⚡ Surprise Pick")
+	keyHint := styleGhost.Render("[S]")
+	labelW := lipgloss.Width(label)
+	keyW := lipgloss.Width(keyHint)
+	headerGap := innerW - labelW - keyW
+	if headerGap < 1 {
+		headerGap = 1
+	}
+	header := label + strings.Repeat(" ", headerGap) + keyHint
+
+	// Repo info
+	name := lipgloss.NewStyle().Bold(true).Foreground(colorFgPrimary).Render(r.FullName)
+	meta := ""
+	if r.Language != "" {
+		meta += "  " + lipgloss.NewStyle().Foreground(langColor(r.Language)).Render("● "+r.Language)
+	}
+	meta += "  " + styleStars.Render(fmt.Sprintf("★ %s", formatStars(r.Stars)))
+
+	var lines []string
+	lines = append(lines, header, name+meta)
 	if r.Description != "" {
 		d := r.Description
-		if len(d) > 60 {
-			d = d[:57] + "..."
+		maxDescW := innerW
+		if len(d) > maxDescW {
+			d = d[:maxDescW-3] + "..."
 		}
-		desc = "\n" + styleMuted.Render("  "+d)
+		lines = append(lines, styleMuted.Render(d))
 	}
-	hint := styleMuted.Render("  enter: view  S: new pick")
-	return lipgloss.JoinVertical(lipgloss.Left, label, name+"  "+lang+"  "+stars+desc, hint)
+	lines = append(lines, styleAccent.Render("enter")+styleMuted.Render(": explore  ·  ")+styleAccent.Render("S")+styleMuted.Render(": reshuffle"))
+
+	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
+
+	// Pulsing border — alternate between pulse and violet
+	var borderColor color.Color = colorAccentPulse
+	if m.firstLaunch && m.firstLaunchFrame%2 == 0 {
+		borderColor = colorAccentViolet
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Padding(0, 1).
+		Width(cardW).
+		Render(content)
 }
 
 // buildAltSearch generates a search query to find alternatives to a dependency.
@@ -2119,29 +2499,7 @@ func (m *appModel) buildAltSearch(depName string) string {
 	return depName + " stars:>10"
 }
 
-// buildLikeSearch generates a search query from a local project's fingerprint.
-func (m *appModel) buildLikeSearch(path string) string {
-	if m.localScanner == nil {
-		return ""
-	}
-	fp, err := m.localScanner.ScanDirectory(path)
-	if err != nil || fp == nil {
-		return ""
-	}
 
-	// Save the scan result
-	if m.store != nil {
-		_ = m.store.SaveProjectFingerprint(*fp)
-	}
-
-	parts := []string{}
-	if fp.Language != "" {
-		parts = append(parts, "language:"+strings.ToLower(fp.Language))
-	}
-	parts = append(parts, "stars:>10")
-
-	return strings.Join(parts, " ")
-}
 
 func (m *appModel) renderFormView() string {
 	formContent := m.searchForm.View(m.width)
@@ -2234,7 +2592,7 @@ func (m *appModel) renderReturnVisitBanner() string {
 	var lines []string
 
 	// Header
-	title := styleMuted.Render("since you were here")
+	title := lipgloss.NewStyle().Foreground(colorGreenGrow).Render("your discoveries are growing")
 	lines = append(lines, title)
 	lines = append(lines, "")
 
@@ -2243,7 +2601,9 @@ func (m *appModel) renderReturnVisitBanner() string {
 	if len(shown) > 5 {
 		shown = shown[:5]
 	}
+	totalDelta := 0
 	for _, r := range shown {
+		totalDelta += r.StarDelta
 		delta := styleSuccess.Render(fmt.Sprintf("▲+%-4d", r.StarDelta))
 		name := stylePrimary.Render(r.FullName)
 		stars := styleMuted.Render(fmt.Sprintf("(%s ★)", formatStars(r.Stars)))
@@ -2257,9 +2617,16 @@ func (m *appModel) renderReturnVisitBanner() string {
 		lines = append(lines, delta+name+strings.Repeat(" ", gap)+stars)
 	}
 
+	// Total delta summary
+	if totalDelta > 0 {
+		lines = append(lines, "")
+		lines = append(lines, styleSuccess.Render(fmt.Sprintf("total: +%d ★", totalDelta))+
+			styleMuted.Render(fmt.Sprintf(" across %d repos", len(shown))))
+	}
+
 	// Hint
 	lines = append(lines, "")
-	hint := styleAccent.Render("enter") + styleMuted.Render(" watchlist  ·  start typing to search")
+	hint := styleAccent.Render("enter") + styleMuted.Render(": watchlist  ·  start typing to search")
 	lines = append(lines, hint)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, lines...)

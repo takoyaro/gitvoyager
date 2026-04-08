@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -12,13 +13,16 @@ import (
 	"github.com/takoyaro/gitvoyager/internal/github"
 	"github.com/takoyaro/gitvoyager/internal/local"
 	"github.com/takoyaro/gitvoyager/internal/model"
+	"github.com/takoyaro/gitvoyager/internal/readme"
 	"github.com/takoyaro/gitvoyager/internal/store"
 	"github.com/takoyaro/gitvoyager/internal/taste"
 )
 
 func searchReposCmd(client *github.Client, st *store.Store, params model.SearchParams) tea.Cmd {
 	return func() tea.Msg {
-		repos, err := client.SearchRepos(context.Background(), params)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		repos, err := client.SearchRepos(ctx, params)
 		if err != nil {
 			return searchErrorMsg{Err: err}
 		}
@@ -38,19 +42,48 @@ func searchReposCmd(client *github.Client, st *store.Store, params model.SearchP
 	}
 }
 
-func enrichRepoCmd(client *github.Client, repo model.Repo) tea.Cmd {
+func enrichRepoCmd(client *github.Client, st *store.Store, repo model.Repo) tea.Cmd {
 	return func() tea.Msg {
-		enriched, err := client.EnrichRepo(context.Background(), repo)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		enriched, err := client.EnrichRepo(ctx, repo)
 		if err != nil {
 			return repoDetailMsg{Repo: repo} // return unenriched on error
 		}
+		model.ComputeIntrinsicScore(&enriched)
+
+		// Persist enrichment signals to DB for future sessions.
+		if st != nil && enriched.Intrinsic != nil {
+			if data, err := json.Marshal(enriched.Intrinsic); err == nil {
+				_ = st.UpdateEnrichment(enriched.FullName, data)
+			}
+		}
+
 		return repoDetailMsg{Repo: enriched}
+	}
+}
+
+func analyzeReadmeCmd(fullName, content string) tea.Cmd {
+	return func() tea.Msg {
+		sigs := readme.Analyze(content)
+		return readmeAnalyzedMsg{FullName: fullName, Score: readme.Score(sigs)}
+	}
+}
+
+func batchIntrinsicProbeCmd(client *github.Client, repos []model.Repo) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		signals, topics, err := client.BatchIntrinsicProbeWithTopics(ctx, repos)
+		return batchIntrinsicMsg{Signals: signals, Topics: topics, Err: err}
 	}
 }
 
 func fetchReadmeCmd(client *github.Client, owner, name string) tea.Cmd {
 	return func() tea.Msg {
-		content, err := client.FetchReadme(context.Background(), owner, name)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		content, err := client.FetchReadme(ctx, owner, name)
 		if err != nil {
 			return readmeErrorMsg{Err: err}
 		}
@@ -60,7 +93,9 @@ func fetchReadmeCmd(client *github.Client, owner, name string) tea.Cmd {
 
 func openBrowserCmd(client *github.Client, repoFullName string) tea.Cmd {
 	return func() tea.Msg {
-		err := client.OpenInBrowser(context.Background(), repoFullName)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := client.OpenInBrowser(ctx, repoFullName)
 		if err != nil {
 			return statusMsg{Text: "Failed to open browser: " + err.Error(), IsError: true}
 		}
@@ -70,14 +105,18 @@ func openBrowserCmd(client *github.Client, repoFullName string) tea.Cmd {
 
 func cloneRepoCmd(client *github.Client, repoFullName, dir string) tea.Cmd {
 	return func() tea.Msg {
-		err := client.CloneRepo(context.Background(), repoFullName, dir)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		err := client.CloneRepo(ctx, repoFullName, dir)
 		return cloneFinishedMsg{FullName: repoFullName, Err: err}
 	}
 }
 
 func fetchRateLimitCmd(client *github.Client) tea.Cmd {
 	return func() tea.Msg {
-		rl, err := client.FetchRateLimit(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		rl, err := client.FetchRateLimit(ctx)
 		if err != nil {
 			return rateLimitMsg{} // silent failure
 		}
@@ -87,8 +126,70 @@ func fetchRateLimitCmd(client *github.Client) tea.Cmd {
 
 func checkGhAuthCmd(client *github.Client) tea.Cmd {
 	return func() tea.Msg {
-		err := client.CheckAuth(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := client.CheckAuth(ctx)
 		return ghAuthCheckedMsg{Err: err}
+	}
+}
+
+// --- Fire-and-forget DB write commands (off the main thread) ---
+
+func saveSearchCmd(st *store.Store, query, sort, lang string, count int) tea.Cmd {
+	return func() tea.Msg {
+		_ = st.SaveSearch(query, sort, lang, count)
+		return nil
+	}
+}
+
+func markSeenCmd(st *store.Store, fullName string) tea.Cmd {
+	return func() tea.Msg {
+		_ = st.MarkSeen(fullName)
+		return nil
+	}
+}
+
+func asyncUpsertReposCmd(st *store.Store, repos []model.Repo) tea.Cmd {
+	return func() tea.Msg {
+		_ = st.UpsertRepos(repos)
+		return nil
+	}
+}
+
+func updateWatchlistViewedAtCmd(st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		_ = st.UpdateWatchlistViewedAt()
+		return nil
+	}
+}
+
+func toggleSearchBookmarkCmd(st *store.Store, id int64) tea.Cmd {
+	return func() tea.Msg {
+		_ = st.ToggleSearchBookmark(id)
+		return nil
+	}
+}
+
+// likeSearchCmd scans a local project directory off the main thread,
+// then returns the constructed search query as a message.
+func likeSearchCmd(scanner *local.Scanner, st *store.Store, path string) tea.Cmd {
+	return func() tea.Msg {
+		if scanner == nil {
+			return likeSearchReadyMsg{}
+		}
+		fp, err := scanner.ScanDirectory(path)
+		if err != nil || fp == nil {
+			return likeSearchReadyMsg{}
+		}
+		if st != nil {
+			_ = st.SaveProjectFingerprint(*fp)
+		}
+		var parts []string
+		if fp.Language != "" {
+			parts = append(parts, "language:"+strings.ToLower(fp.Language))
+		}
+		parts = append(parts, "stars:>10")
+		return likeSearchReadyMsg{Query: strings.Join(parts, " "), Path: path}
 	}
 }
 
@@ -139,7 +240,9 @@ func loadWatchlistReposCmd(st *store.Store) tea.Cmd {
 
 func refreshWatchlistCmd(client *github.Client, fullNames []string) tea.Cmd {
 	return func() tea.Msg {
-		stats, err := client.FetchRepoStats(context.Background(), fullNames)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		stats, err := client.FetchRepoStats(ctx, fullNames)
 		if err != nil {
 			return statusMsg{Text: "Watchlist refresh failed: " + err.Error(), IsError: true}
 		}
@@ -309,7 +412,9 @@ func claudeSummarizeCmd(client *claude.Client, fullName, readme string) tea.Cmd 
 		if client == nil || !client.Available() {
 			return claudeSummaryMsg{FullName: fullName, Err: fmt.Errorf("claude not available")}
 		}
-		summary, err := client.SummarizeReadme(context.Background(), fullName, readme)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		summary, err := client.SummarizeReadme(ctx, fullName, readme)
 		return claudeSummaryMsg{FullName: fullName, Summary: summary, Err: err}
 	}
 }
@@ -319,7 +424,9 @@ func claudeNLSearchCmd(client *claude.Client, query string) tea.Cmd {
 		if client == nil || !client.Available() {
 			return claudeNLSearchMsg{Err: fmt.Errorf("claude not available")}
 		}
-		params, display, err := client.TranslateToSearch(context.Background(), query)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		params, display, err := client.TranslateToSearch(ctx, query)
 		return claudeNLSearchMsg{Params: params, Display: display, Err: err}
 	}
 }
@@ -333,7 +440,9 @@ func syncStarredReposCmd(gh *github.Client, st *store.Store) tea.Cmd {
 		if _, ok := st.GetCached("starred:last_sync"); ok {
 			return starredReposSyncedMsg{}
 		}
-		repos, err := gh.FetchStarredRepos(context.Background(), 200)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		repos, err := gh.FetchStarredRepos(ctx, 200)
 		if err != nil {
 			return starredReposSyncedMsg{Err: err}
 		}
@@ -348,7 +457,9 @@ func topicDriftCmd(client *claude.Client, query string, topics []string) tea.Cmd
 		if client == nil || !client.Available() {
 			return topicDriftMsg{}
 		}
-		suggested, err := client.SuggestAdjacentTopics(context.Background(), query, topics)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		suggested, err := client.SuggestAdjacentTopics(ctx, query, topics)
 		return topicDriftMsg{Topics: suggested, Err: err}
 	}
 }
@@ -358,7 +469,9 @@ func claudeWhyTrendingCmd(client *claude.Client, repo model.Repo, readme string)
 		if client == nil || !client.Available() {
 			return claudeAnalysisMsg{FullName: repo.FullName, Err: fmt.Errorf("claude not available")}
 		}
-		analysis, err := client.WhyTrending(context.Background(), repo, readme)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		analysis, err := client.WhyTrending(ctx, repo, readme)
 		return claudeAnalysisMsg{FullName: repo.FullName, Analysis: analysis, Err: err}
 	}
 }
@@ -445,5 +558,94 @@ func relativeTime(t time.Time) string {
 			return "yesterday"
 		}
 		return fmt.Sprintf("%dd ago", days)
+	}
+}
+
+// Default topics to sample when no user data is available.
+var defaultHeatTopics = []string{
+	"llm", "mcp", "ai-agent", "claude-code", "anthropic", "openai",
+	"coding-agent", "rag", "prompt-engineering", "langchain",
+	"mcp-server", "vibe-coding", "rust", "go", "typescript",
+	"python", "zig", "wasm", "webgpu", "kubernetes", "docker",
+	"game-engine", "security", "cli", "tui", "devtools",
+}
+
+// delayedTopicHeatCmd returns existing data immediately or schedules sampling
+// after a 10-second delay (via tea.Tick, not time.Sleep) so it never blocks a goroutine.
+func delayedTopicHeatCmd(st *store.Store) tea.Cmd {
+	if st == nil {
+		return func() tea.Msg { return topicHeatSampledMsg{} }
+	}
+	if !st.NeedsTopicHeatRefresh() {
+		return func() tea.Msg {
+			hm, _ := st.GetTopicHeatMap()
+			return topicHeatSampledMsg{HeatMap: hm}
+		}
+	}
+	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
+		return topicHeatDelayMsg{}
+	})
+}
+
+func sampleTopicHeatCmd(client *github.Client, st *store.Store) tea.Cmd {
+	return func() tea.Msg {
+		if st == nil {
+			return topicHeatSampledMsg{}
+		}
+
+		// Gather topics: from user's discovered repos + defaults.
+		topics, _ := st.GetTrackedTopics(10)
+		seen := make(map[string]bool, len(topics))
+		for _, t := range topics {
+			seen[t] = true
+		}
+		for _, t := range defaultHeatTopics {
+			if !seen[t] && len(topics) < 25 {
+				topics = append(topics, t)
+				seen[t] = true
+			}
+		}
+
+		now := time.Now()
+		currentStart := now.AddDate(0, 0, -30).Format("2006-01-02")
+		priorStart := now.AddDate(0, 0, -60).Format("2006-01-02")
+		priorEnd := now.AddDate(0, 0, -30).Format("2006-01-02")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+
+		// Sample current 30-day window.
+		currentSamples, err := client.SampleTopicCounts(ctx, topics, 30)
+		if err != nil {
+			return topicHeatSampledMsg{Err: err}
+		}
+
+		for _, s := range currentSamples {
+			_ = st.RecordTopicHeat(s.Topic, s.Count, currentStart, now.Format("2006-01-02"))
+		}
+
+		// Sample prior 30-day window (for comparison).
+		priorSamples, err := client.SampleTopicCounts(ctx, topics, 60)
+		if err != nil {
+			// Still return what we have.
+			hm, _ := st.GetTopicHeatMap()
+			return topicHeatSampledMsg{HeatMap: hm}
+		}
+
+		// Prior window count = 60-day count - 30-day count.
+		currentMap := make(map[string]int)
+		for _, s := range currentSamples {
+			currentMap[s.Topic] = s.Count
+		}
+		for _, s := range priorSamples {
+			priorCount := s.Count - currentMap[s.Topic]
+			if priorCount < 0 {
+				priorCount = 0
+			}
+			_ = st.RecordTopicHeat(s.Topic, priorCount, priorStart, priorEnd)
+		}
+
+		hm, _ := st.GetTopicHeatMap()
+		return topicHeatSampledMsg{HeatMap: hm}
 	}
 }

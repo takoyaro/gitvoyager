@@ -56,7 +56,16 @@ func (m *detailModel) headerHeight() int {
 	if m.height < 20 {
 		return 4 // compact: border(2) + name+stats(1) + gap(1)
 	}
-	return 5 // full: border(2) + name+lang+stats(1) + meter+license(1) + gap(1), topics optional
+	h := 5 // full: border(2) + name+lang+stats(1) + meter+license(1) + gap(1)
+	if m.repo != nil {
+		if len(m.repo.Topics) > 0 {
+			h++ // topics row
+		}
+		if m.repo.Intrinsic != nil {
+			h++ // quality breakdown row
+		}
+	}
+	return h
 }
 
 func (m *detailModel) SetRepo(r *model.Repo) {
@@ -66,6 +75,7 @@ func (m *detailModel) SetRepo(r *model.Repo) {
 	m.aiSummary = ""
 	m.aiAnalysis = ""
 	m.summarizing = false
+	m.viewport.SetHeight(max(1, m.height-m.headerHeight()))
 	m.viewport.GotoTop()
 	m.updateContent()
 }
@@ -88,6 +98,7 @@ func (m *detailModel) SetSummarizing(v bool) {
 
 func (m *detailModel) UpdateRepo(r *model.Repo) {
 	m.repo = r
+	m.viewport.SetHeight(max(1, m.height-m.headerHeight()))
 	m.updateContent()
 }
 
@@ -343,6 +354,14 @@ func (m *detailModel) renderHeader() string {
 		rows = append(rows, topicRow)
 	}
 
+	// Row 4: intrinsic quality breakdown (only if enriched with signals)
+	if r.Intrinsic != nil {
+		qualityRow := renderQualityBreakdown(*r)
+		if qualityRow != "" {
+			rows = append(rows, qualityRow)
+		}
+	}
+
 	inner := lipgloss.JoinVertical(lipgloss.Left, rows...)
 
 	box := lipgloss.NewStyle().
@@ -387,5 +406,57 @@ func formatRelativeTime(t time.Time) string {
 			return "yesterday"
 		}
 		return fmt.Sprintf("%dd ago", days)
+	}
+}
+
+// renderQualityBreakdown returns a compact intrinsic quality summary for the detail header.
+func renderQualityBreakdown(r model.Repo) string {
+	if r.Intrinsic == nil {
+		return ""
+	}
+	s := r.Intrinsic
+
+	grade := renderQualityGrade(r.IntrinsicScore)
+	scoreText := styleMuted.Render(fmt.Sprintf("(%.1f)", r.IntrinsicScore))
+
+	var parts []string
+
+	// README size.
+	if s.ReadmeByteSize > 0 {
+		parts = append(parts, fmt.Sprintf("README: %s", formatBytes(s.ReadmeByteSize)))
+	}
+
+	// CI workflows.
+	if s.CIWorkflowCount > 0 {
+		parts = append(parts, fmt.Sprintf("CI: %d", s.CIWorkflowCount))
+	}
+
+	// License (from repo-level data).
+	if s.HasLicense {
+		parts = append(parts, styleSuccess.Render("License"))
+	}
+
+	// Agent-native.
+	if s.HasClaudeMd {
+		parts = append(parts, lipgloss.NewStyle().Foreground(colorAccentCyan).Render("CLAUDE.md"))
+	}
+
+	// Contributing.
+	if s.HasContributing {
+		parts = append(parts, styleSuccess.Render("CONTRIBUTING"))
+	}
+
+	detail := strings.Join(parts, styleMuted.Render(" · "))
+	return lipgloss.NewStyle().Foreground(colorAccentCyan).Render("◈ Quality: ") + grade + " " + scoreText + "  " + detail
+}
+
+func formatBytes(b int) string {
+	switch {
+	case b >= 1024*1024:
+		return fmt.Sprintf("%.1fMB", float64(b)/(1024*1024))
+	case b >= 1024:
+		return fmt.Sprintf("%.1fKB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%dB", b)
 	}
 }

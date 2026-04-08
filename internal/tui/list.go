@@ -447,7 +447,20 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	if r.Sleeper {
 		sleepTag = lipgloss.NewStyle().Foreground(colorAccentViolet).Render("zzz") + " "
 	}
-	line2Left := pad + agePart + "  " + sleepTag + scorePart
+
+	// Quality grade (from intrinsic score, only shown when enriched).
+	qualityTag := ""
+	if r.IntrinsicScore > 0 {
+		qualityTag = renderQualityGrade(r.IntrinsicScore) + " "
+	}
+
+	// Topic heat indicator.
+	heatTag := ""
+	if r.TopicHeatBoost > 1.3 {
+		heatTag = stylePulse.Render("♨") + " "
+	}
+
+	line2Left := pad + agePart + "  " + heatTag + sleepTag + qualityTag + scorePart
 	line2LeftW := lipgloss.Width(line2Left)
 	forkW := lipgloss.Width(forkPart)
 	gap2 := w - line2LeftW - forkW
@@ -593,4 +606,18 @@ func abbreviateLang(lang string) string {
 		return lang[:2]
 	}
 	return lang
+}
+
+// renderQualityGrade returns a single-character letter grade with color based on intrinsic score.
+func renderQualityGrade(score float64) string {
+	switch {
+	case score > 8:
+		return lipgloss.NewStyle().Foreground(colorGreenGrow).Bold(true).Render("A")
+	case score > 6:
+		return lipgloss.NewStyle().Foreground(colorAccentCyan).Render("B")
+	case score > 4:
+		return lipgloss.NewStyle().Foreground(colorGoldStar).Render("C")
+	default:
+		return styleMuted.Render("D")
+	}
 }
