@@ -19,15 +19,16 @@ Usage:
   gitvoyager data <command> [flags]
 
 Commands:
-  repos      List all discovered repos
-  watchlist  List watchlisted repos
-  searches   Show search history
-  rising     Fastest-rising repos by star velocity
-  taste      Language and topic preferences
-  velocity   Star velocity for a specific repo
-  stats      Aggregate database statistics
-  seen       Repos you've viewed with timestamps
-  local      Local project dependencies
+  repos       List all discovered repos
+  watchlist   List watchlisted repos
+  searches    Show search history
+  rising      Fastest-rising repos by star velocity
+  taste       Language and topic preferences
+  velocity    Star velocity for a specific repo
+  stats       Aggregate database statistics
+  seen        Repos you've viewed with timestamps
+  local       Local project dependencies
+  hot-topics  Topic heat rankings (acceleration ratios)
 
 Per-command flags:
   --limit N      Max results (default varies)
@@ -78,6 +79,8 @@ func runDataCLI(args []string) {
 		cmdSeen(st, subArgs)
 	case "local":
 		cmdLocal(st, subArgs)
+	case "hot-topics":
+		cmdHotTopics(st, subArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown data command: %s\n\n", subcmd)
 		fmt.Print(dataUsage)
@@ -416,4 +419,51 @@ func topN(m map[string]int, n int) map[string]int {
 		result[sorted[i].Key] = sorted[i].Value
 	}
 	return result
+}
+
+func cmdHotTopics(st *store.Store, args []string) {
+	fs := flag.NewFlagSet("hot-topics", flag.ExitOnError)
+	limit := fs.Int("limit", 20, "max topics to show")
+	table := fs.Bool("table", false, "table output")
+	_ = fs.Parse(args)
+
+	topics, err := st.GetHottestTopics(*limit)
+	if err != nil {
+		fatalf("hot-topics: %v", err)
+	}
+
+	if *table {
+		tw := tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "TOPIC\tCURRENT\tPREVIOUS\tGROWTH\tSAMPLED")
+		for _, th := range topics {
+			growth := fmt.Sprintf("%.2fx", th.AccelRatio)
+			if th.AccelRatio > 1.3 {
+				growth += " ♨"
+			}
+			sampled := th.SampledAt.Format("2006-01-02")
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\n",
+				th.Topic, th.Current, th.Previous, growth, sampled)
+		}
+		tw.Flush()
+		return
+	}
+
+	type jsonTopic struct {
+		Topic      string  `json:"topic"`
+		Current    int     `json:"current_repos"`
+		Previous   int     `json:"previous_repos"`
+		AccelRatio float64 `json:"acceleration"`
+		SampledAt  string  `json:"sampled_at"`
+	}
+	out := make([]jsonTopic, len(topics))
+	for i, th := range topics {
+		out[i] = jsonTopic{
+			Topic:      th.Topic,
+			Current:    th.Current,
+			Previous:   th.Previous,
+			AccelRatio: th.AccelRatio,
+			SampledAt:  th.SampledAt.Format(time.RFC3339),
+		}
+	}
+	printJSON(out)
 }

@@ -26,6 +26,22 @@ const repoGraphQLFragment = `
 			}
 		}
 	}
+	readmeFile: object(expression: "HEAD:README.md") { ... on Blob { byteSize } }
+	readmeLower: object(expression: "HEAD:readme.md") { ... on Blob { byteSize } }
+	licenseFile: object(expression: "HEAD:LICENSE") { ... on Blob { byteSize } }
+	licenseMd: object(expression: "HEAD:LICENSE.md") { ... on Blob { byteSize } }
+	ciDir: object(expression: "HEAD:.github/workflows") {
+		... on Tree { entries { name } }
+	}
+	claudeMd: object(expression: "HEAD:CLAUDE.md") { ... on Blob { byteSize } }
+	contributingMd: object(expression: "HEAD:CONTRIBUTING.md") { ... on Blob { byteSize } }
+	gomod: object(expression: "HEAD:go.mod") { ... on Blob { byteSize } }
+	packageJson: object(expression: "HEAD:package.json") { ... on Blob { byteSize } }
+	cargoToml: object(expression: "HEAD:Cargo.toml") { ... on Blob { byteSize } }
+	pyprojectToml: object(expression: "HEAD:pyproject.toml") { ... on Blob { byteSize } }
+	rootTree: object(expression: "HEAD:") {
+		... on Tree { entries { name type } }
+	}
 `
 
 func (c *Client) EnrichRepo(ctx context.Context, repo model.Repo) (model.Repo, error) {
@@ -59,12 +75,68 @@ func (c *Client) EnrichRepo(ctx context.Context, repo model.Repo) (model.Repo, e
 
 	repo.Topics = topics
 	repo.WatcherCount = r.Watchers.TotalCount
+	repo.ContributorCount = r.MentionableUsers.TotalCount
+	repo.OpenPRCount = r.PullRequests.TotalCount
 	if r.DefaultBranchRef != nil {
 		repo.CommitCount = r.DefaultBranchRef.Target.History.TotalCount
 	}
+	if r.LatestRelease != nil {
+		repo.LatestReleaseTag = r.LatestRelease.TagName
+		repo.LatestReleaseAt = r.LatestRelease.PublishedAt
+	}
+
+	// Populate intrinsic signals from structure probes.
+	repo.Intrinsic = buildIntrinsicSignals(&r)
 	repo.Enriched = true
 
 	return repo, nil
+}
+
+// buildIntrinsicSignals extracts structure signals from GraphQL object probes.
+func buildIntrinsicSignals(r *graphQLRepo) *model.IntrinsicSignals {
+	s := &model.IntrinsicSignals{}
+
+	// README size (check both casing variants).
+	if r.ReadmeFile != nil {
+		s.ReadmeByteSize = r.ReadmeFile.ByteSize
+	} else if r.ReadmeLower != nil {
+		s.ReadmeByteSize = r.ReadmeLower.ByteSize
+	}
+
+	// License presence.
+	s.HasLicense = r.LicenseFile != nil || r.LicenseMd != nil
+
+	// CI workflows.
+	if r.CIDir != nil {
+		for _, e := range r.CIDir.Entries {
+			if strings.HasSuffix(e.Name, ".yml") || strings.HasSuffix(e.Name, ".yaml") {
+				s.CIWorkflowCount++
+				s.CIWorkflowNames = append(s.CIWorkflowNames, e.Name)
+			}
+		}
+	}
+
+	// Agent-native signals.
+	s.HasClaudeMd = r.ClaudeMd != nil
+
+	// Contributing guide.
+	s.HasContributing = r.ContribMd != nil
+
+	// Package manifest (any language).
+	s.HasPackageManifest = r.GoMod != nil || r.PackageJSON != nil ||
+		r.CargoToml != nil || r.PyprojectToml != nil
+
+	// Root tree structure.
+	if r.RootTree != nil {
+		for _, e := range r.RootTree.Entries {
+			if e.Type == "tree" {
+				s.RootDirCount++
+				s.RootDirNames = append(s.RootDirNames, e.Name)
+			}
+		}
+	}
+
+	return s
 }
 
 // FetchRepoStats fetches current star/fork/issue counts for a batch of repos
@@ -156,6 +228,92 @@ func (c *Client) fetchRepoStatsBatch(ctx context.Context, fullNames []string, of
 		repos = append(repos, r)
 	}
 	return repos, nil
+}
+
+// BatchIntrinsicProbeWithTopics runs structure probes on a batch of repos via
+// aliased GraphQL queries (15 per request). Returns intrinsic signals and topics
+// for each repo. Used to compute quality grades for search results list view.
+func (c *Client) BatchIntrinsicProbeWithTopics(ctx context.Context, repos []model.Repo) (map[string]*model.IntrinsicSignals, map[string][]string, error) {
+	if len(repos) == 0 {
+		return nil, nil, nil
+	}
+	signals := make(map[string]*model.IntrinsicSignals)
+	topics := make(map[string][]string)
+	const batchSize = 15
+
+	for i := 0; i < len(repos); i += batchSize {
+		end := i + batchSize
+		if end > len(repos) {
+			end = len(repos)
+		}
+		batch := repos[i:end]
+
+		var parts []string
+		for idx, r := range batch {
+			if r.Owner == "" || r.Name == "" {
+				continue
+			}
+			alias := fmt.Sprintf("r%d", idx)
+			parts = append(parts, fmt.Sprintf(`
+				%s: repository(owner: %q, name: %q) {
+					repositoryTopics(first: 20) { nodes { topic { name } } }
+					readmeFile: object(expression: "HEAD:README.md") { ... on Blob { byteSize } }
+					readmeLower: object(expression: "HEAD:readme.md") { ... on Blob { byteSize } }
+					licenseFile: object(expression: "HEAD:LICENSE") { ... on Blob { byteSize } }
+					licenseMd: object(expression: "HEAD:LICENSE.md") { ... on Blob { byteSize } }
+					ciDir: object(expression: "HEAD:.github/workflows") {
+						... on Tree { entries { name } }
+					}
+					claudeMd: object(expression: "HEAD:CLAUDE.md") { ... on Blob { byteSize } }
+					contributingMd: object(expression: "HEAD:CONTRIBUTING.md") { ... on Blob { byteSize } }
+					gomod: object(expression: "HEAD:go.mod") { ... on Blob { byteSize } }
+					packageJson: object(expression: "HEAD:package.json") { ... on Blob { byteSize } }
+					cargoToml: object(expression: "HEAD:Cargo.toml") { ... on Blob { byteSize } }
+					pyprojectToml: object(expression: "HEAD:pyproject.toml") { ... on Blob { byteSize } }
+					rootTree: object(expression: "HEAD:") {
+						... on Tree { entries { name type } }
+					}
+				}`, alias, r.Owner, r.Name))
+		}
+
+		if len(parts) == 0 {
+			continue
+		}
+
+		query := "{ " + strings.Join(parts, "\n") + " }"
+		out, err := c.run(ctx, "api", "graphql", "-f", "query="+query)
+		if err != nil {
+			continue
+		}
+
+		var resp struct {
+			Data map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(out, &resp); err != nil {
+			continue
+		}
+
+		for idx, r := range batch {
+			alias := fmt.Sprintf("r%d", idx)
+			raw, ok := resp.Data[alias]
+			if !ok || string(raw) == "null" {
+				continue
+			}
+			var gr graphQLRepo
+			if err := json.Unmarshal(raw, &gr); err != nil {
+				continue
+			}
+			signals[r.FullName] = buildIntrinsicSignals(&gr)
+			if len(gr.RepositoryTopics.Nodes) > 0 {
+				t := make([]string, len(gr.RepositoryTopics.Nodes))
+				for ti, n := range gr.RepositoryTopics.Nodes {
+					t[ti] = n.Topic.Name
+				}
+				topics[r.FullName] = t
+			}
+		}
+	}
+	return signals, topics, nil
 }
 
 func (c *Client) FetchReadme(ctx context.Context, owner, name string) (string, error) {

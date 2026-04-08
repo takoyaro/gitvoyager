@@ -50,6 +50,30 @@ func (c *Client) SearchRepos(ctx context.Context, params model.SearchParams) ([]
 	if params.Created != "" {
 		args = append(args, "--created="+params.Created)
 	}
+	for _, lic := range params.License {
+		args = append(args, "--license="+lic)
+	}
+	if params.Size != "" {
+		args = append(args, "--size="+params.Size)
+	}
+	for _, m := range params.Match {
+		args = append(args, "--match="+m)
+	}
+	if params.NumberTopics != "" {
+		args = append(args, "--number-topics="+params.NumberTopics)
+	}
+	if params.HelpWantedIssues != "" {
+		args = append(args, "--help-wanted-issues="+params.HelpWantedIssues)
+	}
+	if params.Updated != "" {
+		args = append(args, "--updated="+params.Updated)
+	}
+	if params.IncludeForks != "" {
+		args = append(args, "--include-forks="+params.IncludeForks)
+	}
+	for _, o := range params.Owner {
+		args = append(args, "--owner="+o)
+	}
 	if params.Order != "" {
 		args = append(args, "--order="+params.Order)
 	}

@@ -29,6 +29,9 @@ func New(dbPath string, excCfg *config.ExclusionsConfig) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	// SQLite only supports one concurrent writer; limit the pool to avoid
+	// SQLITE_BUSY contention between goroutines.
+	db.SetMaxOpenConns(1)
 
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
@@ -78,7 +81,10 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(migration007); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(migration008)
+	if _, err := s.db.Exec(migration008); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(migration009)
 	return err
 }
 

@@ -39,13 +39,40 @@ type graphQLResponse struct {
 }
 
 type graphQLRepo struct {
-	Description       string          `json:"description"`
-	RepositoryTopics  topicConnection `json:"repositoryTopics"`
-	MentionableUsers  countConnection `json:"mentionableUsers"`
-	Watchers          countConnection `json:"watchers"`
-	PullRequests      countConnection `json:"pullRequests"`
-	DefaultBranchRef  *branchRef      `json:"defaultBranchRef"`
-	LatestRelease     *release        `json:"latestRelease"`
+	Description      string          `json:"description"`
+	RepositoryTopics topicConnection `json:"repositoryTopics"`
+	MentionableUsers countConnection `json:"mentionableUsers"`
+	Watchers         countConnection `json:"watchers"`
+	PullRequests     countConnection `json:"pullRequests"`
+	DefaultBranchRef *branchRef      `json:"defaultBranchRef"`
+	LatestRelease    *release        `json:"latestRelease"`
+
+	// Structure probes (from object() lookups)
+	ReadmeFile    *blobObject `json:"readmeFile"`
+	ReadmeLower   *blobObject `json:"readmeLower"`
+	LicenseFile   *blobObject `json:"licenseFile"`
+	LicenseMd     *blobObject `json:"licenseMd"`
+	CIDir         *treeObject `json:"ciDir"`
+	ClaudeMd      *blobObject `json:"claudeMd"`
+	ContribMd     *blobObject `json:"contributingMd"`
+	GoMod         *blobObject `json:"gomod"`
+	PackageJSON   *blobObject `json:"packageJson"`
+	CargoToml     *blobObject `json:"cargoToml"`
+	PyprojectToml *blobObject `json:"pyprojectToml"`
+	RootTree      *treeObject `json:"rootTree"`
+}
+
+type blobObject struct {
+	ByteSize int `json:"byteSize"`
+}
+
+type treeEntry struct {
+	Name string `json:"name"`
+	Type string `json:"type"` // "blob" or "tree"
+}
+
+type treeObject struct {
+	Entries []treeEntry `json:"entries"`
 }
 
 type topicConnection struct {

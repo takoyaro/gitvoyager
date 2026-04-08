@@ -60,6 +60,22 @@ func (s *Store) UpsertRepos(repos []model.Repo) error {
 	return tx.Commit()
 }
 
+// UpdateEnrichment stores enrichment data (intrinsic signals, etc.) as JSON.
+func (s *Store) UpdateEnrichment(fullName string, data []byte) error {
+	_, err := s.db.Exec(`UPDATE repos SET enrichment_json = ? WHERE full_name = ?`, string(data), fullName)
+	return err
+}
+
+// GetEnrichment retrieves stored enrichment JSON for a repo.
+func (s *Store) GetEnrichment(fullName string) ([]byte, error) {
+	var data *string
+	err := s.db.QueryRow(`SELECT enrichment_json FROM repos WHERE full_name = ?`, fullName).Scan(&data)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	return []byte(*data), nil
+}
+
 func (s *Store) MarkSeen(repoFullName string) error {
 	_, err := s.db.Exec(`
 		INSERT OR IGNORE INTO seen_log (repo_id, seen_at)

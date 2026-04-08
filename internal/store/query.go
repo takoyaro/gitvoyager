@@ -18,17 +18,25 @@ type Stats struct {
 	StarSnapshots      int `json:"star_snapshots"`
 }
 
-// GetStats returns aggregate counts from all tables.
+// GetStats returns aggregate counts from all tables in a single round-trip.
 func (s *Store) GetStats() (*Stats, error) {
 	var st Stats
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM repos`).Scan(&st.ReposDiscovered)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM watchlist`).Scan(&st.ReposWatched)
-	_ = s.db.QueryRow(`SELECT COUNT(DISTINCT repo_id) FROM seen_log`).Scan(&st.ReposSeen)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM search_history`).Scan(&st.SearchesTotal)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM search_history WHERE bookmarked = 1`).Scan(&st.SearchesBookmarked)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM local_projects`).Scan(&st.LocalProjects)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM local_dependencies`).Scan(&st.LocalDependencies)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM star_snapshots`).Scan(&st.StarSnapshots)
+	err := s.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(*) FROM repos),
+			(SELECT COUNT(*) FROM watchlist),
+			(SELECT COUNT(DISTINCT repo_id) FROM seen_log),
+			(SELECT COUNT(*) FROM search_history),
+			(SELECT COUNT(*) FROM search_history WHERE bookmarked = 1),
+			(SELECT COUNT(*) FROM local_projects),
+			(SELECT COUNT(*) FROM local_dependencies),
+			(SELECT COUNT(*) FROM star_snapshots)
+	`).Scan(&st.ReposDiscovered, &st.ReposWatched, &st.ReposSeen,
+		&st.SearchesTotal, &st.SearchesBookmarked,
+		&st.LocalProjects, &st.LocalDependencies, &st.StarSnapshots)
+	if err != nil {
+		return &st, err
+	}
 	return &st, nil
 }
 
