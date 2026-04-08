@@ -352,7 +352,13 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	} else if r.StarDelta < 0 {
 		deltaText = styleError.Render(fmt.Sprintf(" ▼%d", r.StarDelta))
 	}
-	rightSide := styleStars.Render(starText) + deltaText
+	var accelText string
+	if r.StarAccel > 1.5 {
+		accelText = stylePulse.Render(" ⚡")
+	} else if r.StarAccel > 1.0 {
+		accelText = styleSuccess.Render(" ↗")
+	}
+	rightSide := styleStars.Render(starText) + deltaText + accelText
 
 	// Select bar + prefix
 	selectBar := " "
@@ -379,6 +385,10 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 		}
 	} else if m.seenSet[r.FullName] {
 		prefix = styleMuted.Render("·")
+	} else if r.NewDiscovery {
+		prefix = lipgloss.NewStyle().Foreground(colorAccentCyan).Bold(true).Render("✦")
+	} else if r.Sleeper {
+		prefix = lipgloss.NewStyle().Foreground(colorAccentViolet).Render("◉")
 	}
 
 	// Language dot
@@ -433,7 +443,11 @@ func (m *listModel) renderItem(r model.Repo, selected bool) (string, string) {
 	scorePart := renderScoreBar(r.DiscoveryScore, 10)
 	forkPart := styleMuted.Render(fmt.Sprintf("⑂ %s", formatStars(r.Forks)))
 
-	line2Left := pad + agePart + "  " + scorePart
+	sleepTag := ""
+	if r.Sleeper {
+		sleepTag = lipgloss.NewStyle().Foreground(colorAccentViolet).Render("zzz") + " "
+	}
+	line2Left := pad + agePart + "  " + sleepTag + scorePart
 	line2LeftW := lipgloss.Width(line2Left)
 	forkW := lipgloss.Width(forkPart)
 	gap2 := w - line2LeftW - forkW
