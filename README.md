@@ -20,10 +20,12 @@ GitVoyager flips the model: multi-signal scoring surfaces repos that are
 *active, young, and under-appreciated* — the projects you'd find if you had
 infinite time to browse.
 
-- **5 discovery presets** — Trending, Underdogs, Fresh Signal, Hidden Gems, Rising Stars
+- **9 discovery presets + Hot Space** — Underdogs, Zero-Day Gems, Fresh Signal, Hidden Gems, Craft, Rising Stars, Agent-Ready, Contributor Magnets, Trending — plus a dynamic Hot Space preset fueled by live topic acceleration data
+- **Signal Board** — see which topics are accelerating right now, before you even search
+- **Quality grades** — A/B/C/D letter grades from intrinsic signals (README quality, CI, license, project structure) scored without cloning
 - **Watchlist with star velocity** — track repos over time, see who's growing
 - **AI-powered summaries** — optional Claude integration for README digests and trend analysis
-- **Taste profile** — learns your preferred languages and topics from usage
+- **Taste profile & surprise picks** — learns your preferred languages and topics, serves personalized discoveries
 - **Zero browser required** — search, read READMEs, clone, compare — all in the terminal
 
 ## Install
@@ -49,9 +51,10 @@ gitvoyager data stats         # aggregate discovery stats (JSON)
 gitvoyager data repos --table # browse stored repos in a table
 ```
 
-On first launch you'll land on the search prompt. Type a query or press
-<kbd>1</kbd>–<kbd>5</kbd> to fire a preset. Press <kbd>S</kbd> for a surprise
-pick based on your taste profile.
+On first launch you'll land on the discovery home screen. The Signal Board
+shows accelerating topics, and your Surprise Pick is waiting. Type a query or
+press <kbd>1</kbd>–<kbd>9</kbd> to fire a preset (<kbd>0</kbd> for Hot Space).
+Press <kbd>S</kbd> for a new surprise pick based on your taste profile.
 
 ## Keys
 
@@ -80,13 +83,15 @@ pick based on your taste profile.
 
 ## Scoring
 
-Every result gets three scores computed client-side:
+Every result gets scored client-side across multiple dimensions:
 
 | Score | What it rewards |
 |-------|-----------------|
 | **Discovery** | Stars + forks + issues + recency, normalized by repo age — young active repos rank higher |
 | **Underdog** | Fork-to-star and issue-to-star ratio — finds repos with disproportionate community engagement |
 | **Freshness** | Quality signals (description, license, language) + push recency + youth — gates the Fresh Signal preset |
+| **Intrinsic** | README quality, CI presence, license, CONTRIBUTING guide, project structure — 0–10 score from GraphQL probes, no clone needed |
+| **Topic Heat** | Acceleration ratio of a repo's topics over time — boosts repos in fast-growing problem spaces |
 
 ## Config
 
